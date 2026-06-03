@@ -1,157 +1,80 @@
 """
-counter.py - State machine that counts valid "67" repetitions.
+counter.py - Counts valid 67 motion repetitions with cooldown.
 
-State flow:
-  IDLE
-    → SIX_DETECTED    (when classifier returns "SIX")
-      → MOVING_TO_SEVEN (as motion transitions)
-        → SEVEN_DETECTED  (classifier returns "SEVEN" + sufficient displacement)
-          → REP_COUNTED (rep count incremented, cooldown timer starts)
-            → IDLE (after cooldown)
-
-The machine also resets to IDLE if landmarks are lost for too long,
-or if the user holds a position without completing the motion.
+The MotionAnalyzer handles all cycle detection (peak/valley tracking).
+This module only applies:
+  - Cooldown between reps (prevents double-counting from jitter)
+  - Lost-tracking reset
 """
 
 from __future__ import annotations
 import time
-from enum import Enum, auto
 
 from app.motion_analyzer import MotionFeatures
 
 
-class MotionState(Enum):
-    IDLE = auto()
-    SIX_DETECTED = auto()
-    MOVING_TO_SEVEN = auto()
-    SEVEN_DETECTED = auto()
-    REP_COUNTED = auto()
-
-
 class RepCounter:
     """
-    Consumes classified motion positions frame-by-frame and increments
-    self.count whenever a valid SIX → SEVEN transition is completed.
+    Consumes MotionFeatures frame-by-frame and maintains a rep count.
+
+    Cycle detection lives in the analyzer; this counter simply gates
+    on cooldown timing and resets when tracking is lost.
     """
 
     def __init__(
         self,
-        min_rep_interval: float = 0.5,
-        min_movement_distance: float = 0.08,
+        min_rep_interval: float = 0.3,
         lost_tracking_reset: float = 1.0,
     ):
         self.count: int = 0
-        self.state: MotionState = MotionState.IDLE
-
-        self._min_rep_interval = min_rep_interval
-        self._min_movement_distance = min_movement_distance
-        self._lost_tracking_reset = lost_tracking_reset
+        self._min_interval = min_rep_interval
+        self._lost_reset = lost_tracking_reset
 
         self._last_rep_time: float = 0.0
         self._last_detected_time: float = time.time()
+        self._tracking: bool = False
 
-        # Wrist position when SIX was first detected — used to measure displacement
-        self._six_wrist_pos: tuple[float, float] = (0.0, 0.0)
+    # ── public API ─────────────────────────────────────────────────────────
 
-    # ── Public API ──────────────────────────────────────────────────────────
-
-    def update(self, position: str, features: MotionFeatures) -> bool:
+    def update(self, features: MotionFeatures) -> bool:
         """
-        Feed the current classified position and motion features.
+        Feed the current frame's motion features.
 
-        Args:
-            position : "SIX", "SEVEN", or "NEUTRAL"
-            features : MotionFeatures from the analyzer
-
-        Returns:
-            True if a new rep was just counted this call, else False.
+        Returns True if a new rep was counted this frame.
         """
         now = time.time()
 
-        # ── Handle lost tracking ──────────────────────────────────────────
+        # ── handle lost tracking ──────────────────────────────────────────
         if features.detected:
             self._last_detected_time = now
+            self._tracking = True
         else:
-            if now - self._last_detected_time > self._lost_tracking_reset:
-                self._transition_to(MotionState.IDLE)
+            if now - self._last_detected_time > self._lost_reset:
+                self._tracking = False
             return False
 
-        # ── State machine ─────────────────────────────────────────────────
-        new_rep = False
+        # ── count reps (with cooldown gating) ─────────────────────────────
+        if features.rep_completed and (now - self._last_rep_time) >= self._min_interval:
+            self.count += 1
+            self._last_rep_time = now
+            return True
 
-        if self.state == MotionState.IDLE:
-            if position == "SIX":
-                self._six_wrist_pos = features.wrist_position
-                self._transition_to(MotionState.SIX_DETECTED)
-
-        elif self.state == MotionState.SIX_DETECTED:
-            if position == "SIX":
-                # Still in SIX — update reference position
-                self._six_wrist_pos = features.wrist_position
-            elif position == "SEVEN":
-                # Jumped straight from SIX to SEVEN in one classification
-                # but only if enough movement happened
-                if self._sufficient_movement(features):
-                    self._transition_to(MotionState.SEVEN_DETECTED)
-                else:
-                    self._transition_to(MotionState.IDLE)
-            elif position == "NEUTRAL":
-                # Started moving toward SEVEN
-                self._transition_to(MotionState.MOVING_TO_SEVEN)
-
-        elif self.state == MotionState.MOVING_TO_SEVEN:
-            if position == "SEVEN":
-                if self._sufficient_movement(features):
-                    self._transition_to(MotionState.SEVEN_DETECTED)
-                else:
-                    # Not enough displacement — go back to idle
-                    self._transition_to(MotionState.IDLE)
-            elif position == "SIX":
-                # Reversed back to SIX — restart
-                self._six_wrist_pos = features.wrist_position
-                self._transition_to(MotionState.SIX_DETECTED)
-            # NEUTRAL: keep waiting
-
-        elif self.state == MotionState.SEVEN_DETECTED:
-            # We are in SEVEN; count the rep
-            if self._cooldown_elapsed(now):
-                self.count += 1
-                self._last_rep_time = now
-                new_rep = True
-                self._transition_to(MotionState.REP_COUNTED)
-            else:
-                # Cooldown not elapsed; reset silently
-                self._transition_to(MotionState.IDLE)
-
-        elif self.state == MotionState.REP_COUNTED:
-            # Transition back to IDLE so we can count the next rep
-            self._transition_to(MotionState.IDLE)
-
-        return new_rep
+        return False
 
     def reset(self):
-        """Reset the counter and state machine."""
+        """Reset the counter and internal state."""
         self.count = 0
-        self.state = MotionState.IDLE
         self._last_rep_time = 0.0
-        self._six_wrist_pos = (0.0, 0.0)
+        self._tracking = False
         print("[Counter] Reset.")
 
-    # ── Helpers ──────────────────────────────────────────────────────────
-
-    def _transition_to(self, new_state: MotionState):
-        self.state = new_state
-
-    def _sufficient_movement(self, features: MotionFeatures) -> bool:
-        """Check that the wrist moved far enough from the SIX position."""
-        dx = features.wrist_position[0] - self._six_wrist_pos[0]
-        dy = features.wrist_position[1] - self._six_wrist_pos[1]
-        distance = (dx ** 2 + dy ** 2) ** 0.5
-        return distance >= self._min_movement_distance
-
-    def _cooldown_elapsed(self, now: float) -> bool:
-        return (now - self._last_rep_time) >= self._min_rep_interval
+    # ── display helpers ───────────────────────────────────────────────────
 
     @property
     def state_name(self) -> str:
-        return self.state.name
+        if not self._tracking:
+            return "NO_TRACKING"
+        elapsed = time.time() - self._last_rep_time
+        if self._last_rep_time > 0 and elapsed < 0.5:
+            return "REP_COUNTED"
+        return "TRACKING"

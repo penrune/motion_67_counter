@@ -16,14 +16,20 @@ _YELLOW  = ( 30, 220, 220)
 _RED     = ( 50,  50, 220)
 _CYAN    = (220, 200,  30)
 _ORANGE  = ( 30, 140, 220)
+_DIM     = (140, 140, 140)
 
 # State → color mapping
 _STATE_COLORS: dict[str, tuple] = {
-    "IDLE":             _WHITE,
-    "SIX_DETECTED":     _CYAN,
-    "MOVING_TO_SEVEN":  _YELLOW,
-    "SEVEN_DETECTED":   _GREEN,
-    "REP_COUNTED":      _GREEN,
+    "NO_TRACKING":  _RED,
+    "TRACKING":     _WHITE,
+    "REP_COUNTED":  _GREEN,
+}
+
+# Direction → color mapping
+_DIR_COLORS: dict[str, tuple] = {
+    "UP":   _CYAN,
+    "DOWN": _ORANGE,
+    "IDLE": _DIM,
 }
 
 
@@ -39,19 +45,21 @@ class Overlay:
         count: int,
         state_name: str,
         fps: float,
-        position_label: str,
-        angle: float,
+        direction: str,
+        amplitude: float,
+        hand_count: int,
     ) -> np.ndarray:
         """
         Draw the full HUD onto the frame.
 
         Args:
-            frame         : annotated BGR frame (MediaPipe landmarks already drawn)
-            count         : current rep count
-            state_name    : current MotionState name
-            fps           : current frames per second
-            position_label: "SIX", "SEVEN", or "NEUTRAL"
-            angle         : smoothed primary angle value
+            frame       : annotated BGR frame (MediaPipe landmarks already drawn)
+            count       : current rep count
+            state_name  : current state name (TRACKING / REP_COUNTED / NO_TRACKING)
+            fps         : current frames per second
+            direction   : "UP", "DOWN", or "IDLE"
+            amplitude   : amplitude of last completed swing
+            hand_count  : number of hands/arms currently detected
 
         Returns:
             New BGR frame with HUD overlay.
@@ -60,7 +68,7 @@ class Overlay:
         h, w = out.shape[:2]
 
         # ── Semi-transparent dark panel top-left ──────────────────────────
-        panel_w, panel_h = 300, 160
+        panel_w, panel_h = 310, 195
         self._draw_panel(out, 10, 10, panel_w, panel_h, alpha=0.55)
 
         # ── 67 Counter label ──────────────────────────────────────────────
@@ -76,20 +84,22 @@ class Overlay:
         cv2.putText(out, f"State: {state_name}", (20, 140),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_color, 1, cv2.LINE_AA)
 
-        # ── Position label (SIX / SEVEN / NEUTRAL) ─────────────────────────
-        pos_color = {
-            "SIX":     _CYAN,
-            "SEVEN":   _ORANGE,
-            "NEUTRAL": _WHITE,
-        }.get(position_label, _WHITE)
-        cv2.putText(out, f"Position: {position_label}", (20, 162),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, pos_color, 1, cv2.LINE_AA)
+        # ── Direction ──────────────────────────────────────────────────────
+        dir_color = _DIR_COLORS.get(direction, _WHITE)
+        cv2.putText(out, f"Direction: {direction}", (20, 165),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, dir_color, 1, cv2.LINE_AA)
 
-        # ── FPS & angle (bottom-right panel) ──────────────────────────────
-        self._draw_panel(out, w - 200, h - 75, 190, 65, alpha=0.45)
-        cv2.putText(out, f"FPS: {fps:.1f}", (w - 190, h - 48),
+        # ── Hands detected ─────────────────────────────────────────────────
+        hand_label = "arm" if self.tracking_mode == "pose" else "hand"
+        hand_text = f"Tracking: {hand_count} {hand_label}{'s' if hand_count != 1 else ''}"
+        cv2.putText(out, hand_text, (20, 190),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, _WHITE, 1, cv2.LINE_AA)
+
+        # ── FPS & amplitude (bottom-right panel) ─────────────────────────
+        self._draw_panel(out, w - 220, h - 75, 210, 65, alpha=0.45)
+        cv2.putText(out, f"FPS: {fps:.1f}", (w - 210, h - 48),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, _WHITE, 1, cv2.LINE_AA)
-        cv2.putText(out, f"Angle: {angle:.1f} deg", (w - 190, h - 22),
+        cv2.putText(out, f"Amplitude: {amplitude:.3f}", (w - 210, h - 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, _WHITE, 1, cv2.LINE_AA)
 
         # ── Mode badge ─────────────────────────────────────────────────────

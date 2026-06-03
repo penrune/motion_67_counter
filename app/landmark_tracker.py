@@ -2,7 +2,7 @@
 landmark_tracker.py - MediaPipe Tasks API landmark extraction (mediapipe 0.10+).
 
 Supports two modes:
-  "hand"  — HandLandmarker  (wrist, fingers)
+  "hand"  — HandLandmarker  (wrist, fingers) — up to 2 hands
   "pose"  — PoseLandmarker  (shoulder, elbow, wrist)
 
 Model files must be present in models/ — run setup_models.py first.
@@ -14,7 +14,7 @@ doesn't need to know about MediaPipe internals.
 from __future__ import annotations
 import pathlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
@@ -83,10 +83,19 @@ class PoseLandmarks:
 class LandmarkResult:
     """Unified result from either tracking mode."""
     mode: str
-    hand: Optional[HandLandmarks] = None
+    hands: list[HandLandmarks] = field(default_factory=list)
     pose: Optional[PoseLandmarks] = None
     annotated_image: Optional[np.ndarray] = None
     detected: bool = False
+
+    @property
+    def hand(self) -> Optional[HandLandmarks]:
+        """First detected hand (convenience accessor)."""
+        return self.hands[0] if self.hands else None
+
+    @property
+    def hand_count(self) -> int:
+        return len(self.hands)
 
 
 # ── Tracker ────────────────────────────────────────────────────────────────
@@ -99,10 +108,11 @@ class LandmarkTracker:
     Instantiate once; call process() each frame.
     """
 
-    def __init__(self, mode: str = "hand", draw: bool = True):
+    def __init__(self, mode: str = "hand", draw: bool = True, num_hands: int = 2):
         self.mode = mode
         self.draw = draw
-        self._frame_ts = 0   # monotonically-increasing ms timestamp for VIDEO mode
+        self.num_hands = num_hands
+        self._start_time = time.monotonic()
         self._init_mediapipe()
 
     def _model_path(self, filename: str) -> str:
@@ -121,13 +131,13 @@ class LandmarkTracker:
                     model_asset_path=self._model_path("hand_landmarker.task")
                 ),
                 running_mode=mp_vision.RunningMode.VIDEO,
-                num_hands=1,
+                num_hands=self.num_hands,
                 min_hand_detection_confidence=0.6,
                 min_hand_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
             self._detector = mp_vision.HandLandmarker.create_from_options(opts)
-            print("[Tracker] HandLandmarker (Tasks API) initialized.")
+            print(f"[Tracker] HandLandmarker initialized (num_hands={self.num_hands}).")
 
         elif self.mode == "pose":
             opts = mp_vision.PoseLandmarkerOptions(
@@ -141,7 +151,7 @@ class LandmarkTracker:
                 min_tracking_confidence=0.5,
             )
             self._detector = mp_vision.PoseLandmarker.create_from_options(opts)
-            print("[Tracker] PoseLandmarker (Tasks API) initialized.")
+            print("[Tracker] PoseLandmarker initialized.")
 
         else:
             raise ValueError(f"Unknown tracking mode '{self.mode}'. Use 'hand' or 'pose'.")
@@ -155,51 +165,59 @@ class LandmarkTracker:
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
         mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
 
-        # Increment timestamp (must be strictly increasing in VIDEO mode)
-        self._frame_ts += 33   # ~30 fps assumption; exact value doesn't matter
+        # Use real wall-clock timestamps for proper temporal smoothing
+        frame_ts_ms = int((time.monotonic() - self._start_time) * 1000)
 
         if self.mode == "hand":
-            return self._process_hand(bgr_frame, mp_image)
+            return self._process_hand(bgr_frame, mp_image, frame_ts_ms)
         else:
-            return self._process_pose(bgr_frame, mp_image)
+            return self._process_pose(bgr_frame, mp_image, frame_ts_ms)
 
     # ── Hand mode ────────────────────────────────────────────────────────
 
-    def _process_hand(self, bgr: np.ndarray, mp_image: Image) -> LandmarkResult:
-        result = self._detector.detect_for_video(mp_image, self._frame_ts)
+    def _process_hand(
+        self, bgr: np.ndarray, mp_image: Image, ts_ms: int
+    ) -> LandmarkResult:
+        result = self._detector.detect_for_video(mp_image, ts_ms)
         annotated = bgr.copy()
 
         if not result.hand_landmarks:
             return LandmarkResult(mode="hand", detected=False, annotated_image=annotated)
 
-        # First detected hand
-        lm = result.hand_landmarks[0]   # list of NormalizedLandmark
+        hands: list[HandLandmarks] = []
 
-        if self.draw:
-            mp_drawing.draw_landmarks(
-                image=annotated,
-                landmark_list=lm,
-                connections=HandLandmarksConnections.HAND_CONNECTIONS,
+        for lm in result.hand_landmarks:
+            if self.draw:
+                mp_drawing.draw_landmarks(
+                    image=annotated,
+                    landmark_list=lm,
+                    connections=HandLandmarksConnections.HAND_CONNECTIONS,
+                )
+
+            def p(idx: int, _lm=lm) -> Point:
+                return Point(_lm[idx].x, _lm[idx].y)
+
+            hand = HandLandmarks(
+                wrist=p(_H.WRIST),
+                index_mcp=p(_H.INDEX_MCP),
+                index_tip=p(_H.INDEX_TIP),
+                middle_mcp=p(_H.MIDDLE_MCP),
+                middle_tip=p(_H.MIDDLE_TIP),
+                thumb_cmc=p(_H.THUMB_CMC),
+                thumb_tip=p(_H.THUMB_TIP),
             )
+            hands.append(hand)
 
-        def p(idx) -> Point:
-            return Point(lm[idx].x, lm[idx].y)
-
-        hand = HandLandmarks(
-            wrist=p(_H.WRIST),
-            index_mcp=p(_H.INDEX_MCP),
-            index_tip=p(_H.INDEX_TIP),
-            middle_mcp=p(_H.MIDDLE_MCP),
-            middle_tip=p(_H.MIDDLE_TIP),
-            thumb_cmc=p(_H.THUMB_CMC),
-            thumb_tip=p(_H.THUMB_TIP),
+        return LandmarkResult(
+            mode="hand", hands=hands, detected=True, annotated_image=annotated
         )
-        return LandmarkResult(mode="hand", hand=hand, detected=True, annotated_image=annotated)
 
     # ── Pose mode ─────────────────────────────────────────────────────────
 
-    def _process_pose(self, bgr: np.ndarray, mp_image: Image) -> LandmarkResult:
-        result = self._detector.detect_for_video(mp_image, self._frame_ts)
+    def _process_pose(
+        self, bgr: np.ndarray, mp_image: Image, ts_ms: int
+    ) -> LandmarkResult:
+        result = self._detector.detect_for_video(mp_image, ts_ms)
         annotated = bgr.copy()
 
         if not result.pose_landmarks:
@@ -226,7 +244,9 @@ class LandmarkTracker:
             right_elbow=p(P.RIGHT_ELBOW),
             right_wrist=p(P.RIGHT_WRIST),
         )
-        return LandmarkResult(mode="pose", pose=pose, detected=True, annotated_image=annotated)
+        return LandmarkResult(
+            mode="pose", pose=pose, detected=True, annotated_image=annotated
+        )
 
     def close(self):
         """Release MediaPipe resources."""

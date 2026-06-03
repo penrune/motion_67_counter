@@ -36,18 +36,27 @@ def main():
         print(f"[Main] FATAL: {e}")
         sys.exit(1)
 
-    tracker = LandmarkTracker(mode=mode, draw=cfg.draw_landmarks)
+    try:
+        tracker = LandmarkTracker(
+            mode=mode,
+            draw=cfg.draw_landmarks,
+            num_hands=cfg.num_hands,
+        )
+    except FileNotFoundError as e:
+        print(f"[Main] FATAL: {e}")
+        print("[Main] Run 'python setup_models.py' to download the required model files.")
+        camera.release()
+        sys.exit(1)
 
     analyzer = MotionAnalyzer(
         mode=mode,
-        six_angle_threshold=cfg.six_position_angle_threshold,
-        seven_angle_threshold=cfg.seven_position_angle_threshold,
-        smoothing_window=cfg.movement_smoothing_window,
+        smoothing_factor=cfg.smoothing_factor,
+        min_swing_amplitude=cfg.min_swing_amplitude,
+        direction_reversal_threshold=cfg.direction_reversal_threshold,
     )
 
     counter = RepCounter(
         min_rep_interval=cfg.min_rep_interval_seconds,
-        min_movement_distance=cfg.min_movement_distance,
         lost_tracking_reset=cfg.lost_tracking_reset_seconds,
     )
 
@@ -75,7 +84,7 @@ def main():
         now = time.time()
         elapsed = now - prev_time
         prev_time = now
-        fps = 1.0 / elapsed if elapsed > 0 else 0.0
+        fps = min(1.0 / elapsed, 120.0) if elapsed > 0.001 else 0.0
         fps_history.append(fps)
         if len(fps_history) > 30:
             fps_history.pop(0)
@@ -84,12 +93,11 @@ def main():
         # ── Landmark detection ────────────────────────────────────────────
         result = tracker.process(frame)
 
-        # ── Motion analysis ───────────────────────────────────────────────
+        # ── Motion analysis (cycle detection happens here) ────────────────
         features = analyzer.analyze(result)
-        position = analyzer.classify(features)
 
-        # ── State machine update ──────────────────────────────────────────
-        new_rep = counter.update(position, features)
+        # ── Rep counting (cooldown gating) ────────────────────────────────
+        new_rep = counter.update(features)
         if new_rep:
             print(f"[Counter] Rep counted! Total: {counter.count}")
 
@@ -100,8 +108,9 @@ def main():
             count=counter.count,
             state_name=counter.state_name,
             fps=smooth_fps,
-            position_label=position,
-            angle=features.primary_angle,
+            direction=features.direction,
+            amplitude=features.amplitude,
+            hand_count=features.hand_count,
         )
 
         cv2.imshow("67 Meme Counter", display_frame)
@@ -112,6 +121,7 @@ def main():
             break
         elif key == ord("r"):
             counter.reset()
+            analyzer.reset()
 
     # ── Cleanup ───────────────────────────────────────────────────────────
     print("[Main] Shutting down...")

@@ -12,13 +12,13 @@ CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.json"
 
 DEFAULTS = {
     "camera_index": 0,
-    "tracking_mode": "hand",           # "hand" or "pose"
-    "min_rep_interval_seconds": 0.5,   # Minimum seconds between counted reps
-    "movement_smoothing_window": 5,    # Number of frames to smooth over
-    "six_position_angle_threshold": 45,   # Angle (deg) below this = SIX position
-    "seven_position_angle_threshold": 100, # Angle (deg) above this = SEVEN position
-    "min_movement_distance": 0.08,     # Minimum normalized wrist displacement to count
-    "lost_tracking_reset_seconds": 1.0, # Seconds without landmarks before state reset
+    "tracking_mode": "hand",              # "hand" or "pose"
+    "num_hands": 2,                       # how many hands to track (1 or 2)
+    "min_rep_interval_seconds": 0.3,      # cooldown between counted reps
+    "smoothing_factor": 0.35,             # EMA alpha (higher = less smoothing)
+    "min_swing_amplitude": 0.08,          # minimum wrist-Y travel to count a swing
+    "direction_reversal_threshold": 0.015,# minimum Y delta to confirm a reversal
+    "lost_tracking_reset_seconds": 1.0,   # seconds without landmarks before reset
     "draw_landmarks": True,
     "save_sessions": True,
 }
