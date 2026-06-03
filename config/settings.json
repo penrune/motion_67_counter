@@ -1,0 +1,12 @@
+{
+  "camera_index": 0,
+  "tracking_mode": "hand",
+  "min_rep_interval_seconds": 0.5,
+  "movement_smoothing_window": 5,
+  "six_position_angle_threshold": 45,
+  "seven_position_angle_threshold": 100,
+  "min_movement_distance": 0.08,
+  "lost_tracking_reset_seconds": 1.0,
+  "draw_landmarks": true,
+  "save_sessions": true
+}
