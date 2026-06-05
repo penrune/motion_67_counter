@@ -393,7 +393,7 @@ class MotionAnalyzer:
                 matched_player_ids.add(p_id)
 
                 player = self.players[p_id]
-                player.center = f_det["center"]
+                player.center = f_det["center"] # Keep center strictly at face center
                 player.last_seen_face_center = f_det["center"]
                 player.last_seen = time.time()
 
@@ -489,7 +489,7 @@ class MotionAnalyzer:
                 })
 
         # ── 3. Candidate-to-Player Proximity Mapping ─────────────────────────
-        # Hand candidates are matched to the closest active player.
+        # Hand candidates are matched to the closest active player's face/body center.
         # This allows multiple hand candidates (e.g. left and right hand) to map to a single player.
         player_candidates = {p_id: [] for p_id in self.players}
 
@@ -498,14 +498,8 @@ class MotionAnalyzer:
             min_dist = float('inf')
             
             for p_id, player in self.players.items():
-                # Measure distance to player's center or their face center
-                dist_prev = np.linalg.norm(cand["center"] - player.center)
-                dist_face = float('inf')
-                face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
-                if face_match is not None:
-                    dist_face = np.linalg.norm(cand["center"] - face_match["center"])
-                
-                dist = min(dist_prev, dist_face)
+                # We always match relative to the face/body center (player.center)
+                dist = np.linalg.norm(cand["center"] - player.center)
                 if dist < min_dist:
                     min_dist = dist
                     best_p_id = p_id
@@ -517,12 +511,9 @@ class MotionAnalyzer:
         for p_id, player in self.players.items():
             cands = player_candidates[p_id]
             if cands:
+                # Do NOT overwrite player.center with hand center to keep face matching stable
                 if self.mode == "hand":
-                    # If player has multiple hands, sort them from left to right (X coordinate)
                     cands.sort(key=lambda x: x["center"][0])
-                    player.center = np.mean([c["center"] for c in cands], axis=0)
-                    
-                    # Store both hands in the landmarks list
                     player.update_motion(
                         left_y=cands[0]["left_y"],
                         right_y=cands[1]["left_y"] if len(cands) > 1 else None,
@@ -531,9 +522,8 @@ class MotionAnalyzer:
                         landmarks_list=[c["landmarks"] for c in cands]
                     )
                 else:  # pose mode
-                    # Pose mode has exactly 1 candidate representing the person
                     cand = cands[0]
-                    player.center = cand["center"]
+                    player.center = cand["center"] # pose center is shoulder center, close to face
                     player.update_motion(
                         left_y=cand["left_y"],
                         right_y=cand["right_y"],
@@ -543,7 +533,7 @@ class MotionAnalyzer:
                     )
             else:
                 player.tick_lost()
-                # If face is still detected in this frame, update center position so they don't timeout
+                # If face is still detected in this frame, update center position
                 face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
                 if face_match is not None:
                     player.center = face_match["center"]
