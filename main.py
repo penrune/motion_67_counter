@@ -20,6 +20,7 @@ from app.config import Config
 from app.camera import Camera
 from app.landmark_tracker import LandmarkTracker, LandmarkResult
 from app.motion_analyzer import MotionAnalyzer
+from app.telegram_bot import send_telegram_photo_async
 from app.overlay import Overlay
 from app.storage import SessionStorage
 
@@ -139,6 +140,7 @@ def main():
         adaptive_thresholds=cfg.adaptive_thresholds,
         min_rep_interval=cfg.min_rep_interval_seconds,
         lost_tracking_reset=cfg.lost_tracking_reset_seconds,
+        face_recognition_threshold=cfg.face_recognition_threshold,
     )
 
     overlay = Overlay(tracking_mode=mode)
@@ -151,6 +153,10 @@ def main():
     fps_history: list[float] = []
     prev_time = time.time()
     player_scores: dict[str, int] = {}
+    
+    bot_token = cfg.telegram_bot_token
+    chat_id = cfg.telegram_chat_id
+    session_high_score = 0
 
     print("[Main] Running. Press R to reset counter, Q to quit.")
 
@@ -190,7 +196,23 @@ def main():
                 last_players = last_features.players
                 # Update all-time session scores for players
                 for p in last_players:
-                    player_scores[p.name] = max(player_scores.get(p.name, 0), p.rep_counter.count)
+                    reps = p.rep_counter.count
+                    player_scores[p.name] = max(player_scores.get(p.name, 0), reps)
+                    
+                    # Check for breaking session high score (baseline >= 3 reps)
+                    if reps > session_high_score and session_high_score >= 3:
+                        if not p.high_score_alert_sent_this_run:
+                            p.high_score_alert_sent_this_run = True
+                            p.pending_high_score_alert = True
+                            p.prev_high_score_for_alert = session_high_score
+                            print(f"[Main] Player {p.id} set new session high score: {reps} (previous: {session_high_score})")
+                            
+                    if reps > session_high_score:
+                        session_high_score = reps
+                        
+                    # Cache best frame update flag if they just completed a rep
+                    if p.rep_completed_this_frame:
+                        p.pending_best_frame_update = True
             else:
                 last_players = []
 
@@ -213,6 +235,51 @@ def main():
             players=last_players
         )
 
+        # Post-draw hooks for screenshots & Telegram alerts
+        for p in last_players:
+            # Update best frame snapshot
+            if getattr(p, "pending_best_frame_update", False):
+                p.best_frame = display_frame.copy()
+                p.pending_best_frame_update = False
+                
+            # Send milestone/high score alert
+            if getattr(p, "pending_high_score_alert", False):
+                p.pending_high_score_alert = False
+                _, buffer = cv2.imencode('.jpg', display_frame)
+                photo_bytes = buffer.tobytes()
+                caption = (
+                    f"🔥 NEW HIGH SCORE! 🏆\n"
+                    f"Player {p.id} has just broken the session high score! "
+                    f"Current score: {p.rep_counter.count} reps! 💥"
+                )
+                send_telegram_photo_async(bot_token, chat_id, photo_bytes, caption)
+
+        # ── Run 10-Second Away Cooldown / Session Completed Check ──────────
+        now_time = time.time()
+        for p_id, p in list(analyzer.players.items()):
+            if now_time - p.last_seen > 10.0:
+                if p.rep_counter._tracking:
+                    p.rep_counter._tracking = False
+                
+                if p.rep_counter.count > 0:
+                    if p.rep_counter.count >= 3 and not p.telegram_session_alert_sent:
+                        p.telegram_session_alert_sent = True
+                        alert_frame = p.best_frame if p.best_frame is not None else display_frame
+                        _, buffer = cv2.imencode('.jpg', alert_frame)
+                        photo_bytes = buffer.tobytes()
+                        caption = (
+                            f"🏆 Session Completed!\n"
+                            f"Player {p.id} finished their run with a total of {p.rep_counter.count} reps! 🎉"
+                        )
+                        send_telegram_photo_async(bot_token, chat_id, photo_bytes, caption)
+                        print(f"[Main] Telegram alert sent: Player {p.id} completed session with {p.rep_counter.count} reps.")
+                    
+                    # Reset player state for their next run
+                    p.rep_counter.count = 0
+                    p.high_score_alert_sent_this_run = False
+                    p.telegram_session_alert_sent = False
+                    p.best_frame = None
+
         cv2.imshow("67 Meme Counter", display_frame)
 
         # ── Keyboard input ────────────────────────────────────────────────
@@ -222,7 +289,8 @@ def main():
         elif key == ord("r"):
             analyzer.reset()
             player_scores.clear()
-            print("[Main] All counts reset.")
+            session_high_score = 0
+            print("[Main] All counts and session high scores reset.")
 
     # ── Cleanup ───────────────────────────────────────────────────────────
     print("[Main] Shutting down...")

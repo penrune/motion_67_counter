@@ -11,5 +11,8 @@
   "tracking_match_threshold": 0.25,
   "adaptive_thresholds": true,
   "draw_landmarks": true,
-  "save_sessions": true
+  "save_sessions": true,
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "face_recognition_threshold": 85.0
 }

@@ -1,23 +1,19 @@
 """
-motion_analyzer.py - Peak/valley cycle detection for the 67 motion counter.
+motion_analyzer.py - Face recognition-based player tracking and motion cycle detection.
 
-Instead of classifying frames as SIX/SEVEN/NEUTRAL with static angle
-thresholds, we track the vertical position (Y-coordinate) of the wrist
-over time and count complete up-down oscillation cycles.
-
-Detection pipeline:
-  1. Smooth the wrist Y with an exponential moving average (EMA)
-  2. Detect direction reversals (UP→DOWN or DOWN→UP) with a noise gate
-  3. Measure the amplitude of each half-swing
-  4. Two consecutive half-swings with sufficient amplitude = one rep
+Combines MediaPipe landmark tracking with OpenCV Haar Cascade face detection
+and LBPH face recognition to identify players dynamically, maintain their scores,
+and resume counting when they leave and return.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import time
 from typing import Optional
 import numpy as np
+import cv2
 
 from app.landmark_tracker import LandmarkResult, HandLandmarks
 from app.counter import RepCounter
@@ -44,8 +40,7 @@ class SwingDetector:
     Detects up-down oscillation cycles for a single tracked hand or arm.
 
     Tracks the smoothed wrist Y position, detects direction reversals,
-    and counts full cycles.  Two consecutive half-swings whose amplitude
-    exceeds ``min_amplitude`` are counted as one repetition.
+    and counts full cycles.
     """
 
     def __init__(
@@ -59,42 +54,20 @@ class SwingDetector:
         self.rev_thresh = reversal_threshold
         self._reset_state()
 
-    # ── internal state ─────────────────────────────────────────────────────
-
     def _reset_state(self):
         self.smooth_y: Optional[float] = None
         self.prev_smooth_y: Optional[float] = None
         self.direction: str = "IDLE"
-
-        # The most extreme Y reached during the current half-swing
         self.extremum_y: float = 0.0
-        # Y at the point the last reversal was confirmed
         self.reversal_y: float = 0.0
-        # True when one valid half-swing is "banked", waiting for a second
         self.pending_half: bool = False
-
         self.amplitude: float = 0.0
         self.activity: float = 0.0        # rolling score of recent movement
         self.frames_since_update: int = 0
 
-    # ── public API ─────────────────────────────────────────────────────────
-
     def update(self, wrist_y: float) -> tuple[bool, str, float]:
-        """
-        Feed a new wrist-Y value for this frame.
-
-        Returns
-        -------
-        rep_completed : bool
-            True if a full oscillation cycle just completed.
-        direction : str
-            Current movement direction ("UP", "DOWN", or "IDLE").
-        amplitude : float
-            Amplitude of the last completed half-swing.
-        """
         self.frames_since_update = 0
 
-        # ── first frame: just initialise ──────────────────────────────────
         if self.smooth_y is None:
             self.smooth_y = wrist_y
             self.prev_smooth_y = wrist_y
@@ -102,60 +75,47 @@ class SwingDetector:
             self.reversal_y = wrist_y
             return False, "IDLE", 0.0
 
-        # ── EMA smoothing ─────────────────────────────────────────────────
         self.prev_smooth_y = self.smooth_y
         self.smooth_y = self.alpha * wrist_y + (1.0 - self.alpha) * self.smooth_y
 
         delta = self.smooth_y - self.prev_smooth_y
         self.activity = 0.3 * abs(delta) + 0.7 * self.activity
 
-        # ── track the extremum in the current half-swing ──────────────────
         if self.direction == "UP":
-            # arm going up → Y is decreasing → track minimum
             if self.smooth_y < self.extremum_y:
                 self.extremum_y = self.smooth_y
         elif self.direction == "DOWN":
-            # arm going down → Y is increasing → track maximum
             if self.smooth_y > self.extremum_y:
                 self.extremum_y = self.smooth_y
         else:
             self.extremum_y = self.smooth_y
 
-        # ── below the noise gate? no direction update ─────────────────────
         if abs(delta) < self.rev_thresh:
             return False, self.direction, self.amplitude
 
         new_dir = "UP" if delta < 0 else "DOWN"
 
-        # ── first direction after IDLE ────────────────────────────────────
         if self.direction == "IDLE":
             self.direction = new_dir
             self.reversal_y = self.smooth_y
             self.extremum_y = self.smooth_y
             return False, self.direction, self.amplitude
 
-        # ── same direction: keep going ────────────────────────────────────
         if new_dir == self.direction:
             return False, self.direction, self.amplitude
 
-        # ── direction reversal detected ───────────────────────────────────
         half_amp = abs(self.extremum_y - self.reversal_y)
-
         rep = False
         if half_amp >= self.min_amp:
             self.amplitude = half_amp
             if self.pending_half:
-                # second valid half-swing → full cycle
                 rep = True
                 self.pending_half = False
             else:
-                # first valid half-swing → bank it
                 self.pending_half = True
         else:
-            # swing too small → rhythm broken, reset pending
             self.pending_half = False
 
-        # the extremum of the completed half-swing is the start of the next
         self.reversal_y = self.extremum_y
         self.extremum_y = self.smooth_y
         self.direction = new_dir
@@ -163,9 +123,8 @@ class SwingDetector:
         return rep, self.direction, self.amplitude
 
     def tick(self):
-        """Call when this detector is NOT updated (hand not visible)."""
         self.frames_since_update += 1
-        if self.frames_since_update > 30:      # ~1 s at 30 fps
+        if self.frames_since_update > 30:
             self._reset_state()
 
     def reset(self):
@@ -176,7 +135,7 @@ class SwingDetector:
 
 class TrackedPlayer:
     """
-    Tracks state, motion metrics, and rep count for a single person/hand.
+    Tracks state, motion metrics, and rep count for a single person.
     """
 
     def __init__(self, player_id: int, center: np.ndarray, tracking_mode: str, det_kw: dict):
@@ -187,11 +146,16 @@ class TrackedPlayer:
         self.tracking_mode = tracking_mode
         self.det_kw = det_kw
 
-        # Colors for visualization (BGR)
+        # Visual attributes
         self.color = self._get_color(player_id)
+        self.last_seen_face_center: Optional[np.ndarray] = None
 
-        # Swing detectors (0 = left hand/wrist/arm, 1 = right hand/wrist/arm)
-        # Note: in pose mode, we track both left and right wrists. In hand mode, we track wrist Y.
+        # Telegram session alert flag and best frame cache
+        self.telegram_session_alert_sent = False
+        self.high_score_alert_sent_this_run = False
+        self.best_frame: Optional[np.ndarray] = None
+
+        # Swing detectors (0 = left hand/arm, 1 = right hand/arm)
         self.detectors = [
             SwingDetector(
                 smoothing_factor=det_kw.get("smoothing_factor", 0.45),
@@ -237,13 +201,12 @@ class TrackedPlayer:
             ref_scale = 0.20 if self.tracking_mode == "pose" else 0.12
             ratio = scale / ref_scale
             if self.tracking_mode == "hand":
-                ratio = min(1.0, ratio)  # Don't scale up (make harder) for hands when close
+                ratio = min(1.0, ratio)
             ratio = max(0.4, min(1.5, ratio))
             scaled_amp = base_amp * ratio
         else:
             scaled_amp = base_amp
 
-        # Update both detectors with the possibly scaled amplitude threshold
         for d in self.detectors:
             d.min_amp = scaled_amp
 
@@ -259,8 +222,6 @@ class TrackedPlayer:
         else:
             self.detectors[1].tick()
 
-        # Update player display features (wrist_y, direction, amplitude, activity)
-        # using the more active detector/arm
         if self.detectors[0].activity >= self.detectors[1].activity:
             self.direction = l_dir
             self.amplitude = l_amp
@@ -272,7 +233,6 @@ class TrackedPlayer:
             self.wrist_y = self.detectors[1].smooth_y or (right_y if right_y is not None else 0.0)
             self.activity = self.detectors[1].activity
 
-        # Feed the rep counter
         dummy_features = MotionFeatures(
             detected=True,
             wrist_y=self.wrist_y,
@@ -288,7 +248,6 @@ class TrackedPlayer:
         self.activity *= 0.95
         self.rep_completed_this_frame = False
         
-        # Signal tracking lost to the counter so it handles state properly
         dummy_features = MotionFeatures(detected=False)
         self.rep_counter.update(dummy_features)
 
@@ -297,8 +256,8 @@ class TrackedPlayer:
 
 class MotionAnalyzer:
     """
-    Maintains a fixed set of TrackedPlayers corresponding to spatial screen slots (left to right).
-    Differentiates players by horizontal coordinate zones to keep IDs stable even if they exit the frame.
+    Tracks multiple players dynamically using Haar Cascade face detection,
+    an online LBPH face recognizer, and greedy proximity matching.
     """
 
     def __init__(
@@ -311,10 +270,12 @@ class MotionAnalyzer:
         adaptive_thresholds: bool = True,
         min_rep_interval: float = 0.2,
         lost_tracking_reset: float = 1.0,
+        face_recognition_threshold: float = 85.0,
         max_players: int = 2,
     ):
         self.mode = mode
         self.adaptive_thresholds = adaptive_thresholds
+        self.face_recognition_threshold = face_recognition_threshold
 
         self.det_kw = dict(
             smoothing_factor=smoothing_factor,
@@ -325,23 +286,146 @@ class MotionAnalyzer:
             max_players=max_players,
         )
 
-        # Pre-initialize permanent slots/players (never deleted)
-        self.num_slots = max_players
+        # Initialize face classifier
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        self.face_cascade = cv2.CascadeClassifier(cascade_path)
+        
+        # Initialize face recognizer
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+        self.recognizer_trained = False
+        
+        # Dynamic player mapping
         self.players: dict[int, TrackedPlayer] = {}
-        self.reset()
+        self.next_player_id = 1
 
     def analyze(self, result: LandmarkResult) -> MotionFeatures:
         """
-        Process a list of hands/poses from the LandmarkResult.
-        Assigns candidates to permanent spatial slots (Player 1, Player 2, etc.) based on X-coordinate.
+        Processes a LandmarkResult and camera frame to identify and update player counts.
         """
-        if not result.detected:
-            # Tick all players
+        # Determine the target frame to analyze (use raw image if available)
+        frame = result.raw_image if (result.raw_image is not None) else result.annotated_image
+        if frame is None:
             for p in self.players.values():
                 p.tick_lost()
             return MotionFeatures(detected=False, players=list(self.players.values()))
 
-        # 1. Extract candidates with center position and scale
+        # ── 1. Detect and Identify Faces ─────────────────────────────────────
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(45, 45)
+        )
+
+        detected_faces = []
+        predictions = []
+
+        for (x, y, w, h) in faces:
+            fcx = (x + w/2) / frame.shape[1]
+            fcy = (y + h/2) / frame.shape[0]
+            face_center = np.array([fcx, fcy])
+            
+            roi = gray[y:y+h, x:x+w]
+            roi_resized = cv2.resize(roi, (100, 100))
+
+            if not self.recognizer_trained:
+                # First face: enroll Player 1
+                p_id = self.next_player_id
+                self.next_player_id += 1
+                
+                self.players[p_id] = TrackedPlayer(
+                    player_id=p_id,
+                    center=face_center,
+                    tracking_mode=self.mode,
+                    det_kw=self.det_kw
+                )
+                self.players[p_id].last_seen_face_center = face_center
+                
+                self.recognizer.train([roi_resized], np.array([p_id]))
+                self.recognizer_trained = True
+                
+                predictions.append({
+                    "player_id": p_id,
+                    "confidence": 0.0,
+                    "center": face_center,
+                    "rect": (x, y, w, h),
+                    "roi": roi_resized
+                })
+            else:
+                p_id, confidence = self.recognizer.predict(roi_resized)
+                predictions.append({
+                    "player_id": p_id,
+                    "confidence": confidence,
+                    "center": face_center,
+                    "rect": (x, y, w, h),
+                    "roi": roi_resized
+                })
+
+        # Resolve duplicate predictions and enroll new players
+        predictions.sort(key=lambda x: x["confidence"])
+        assigned_player_ids = set()
+
+        for pred in predictions:
+            p_id = pred["player_id"]
+            confidence = pred["confidence"]
+            face_center = pred["center"]
+            x, y, w, h = pred["rect"]
+            roi_resized = pred["roi"]
+
+            if p_id in assigned_player_ids or confidence > self.face_recognition_threshold:
+                # Unrecognized face or ID conflict: Enroll a new player
+                new_id = self.next_player_id
+                self.next_player_id += 1
+                
+                self.players[new_id] = TrackedPlayer(
+                    player_id=new_id,
+                    center=face_center,
+                    tracking_mode=self.mode,
+                    det_kw=self.det_kw
+                )
+                self.players[new_id].last_seen_face_center = face_center
+                
+                self.recognizer.update([roi_resized], np.array([new_id]))
+                assigned_player_ids.add(new_id)
+                
+                detected_faces.append({
+                    "player_id": new_id,
+                    "center": face_center,
+                    "rect": (x, y, w, h)
+                })
+                print(f"[MotionAnalyzer] Enrolled Player {new_id} dynamically (conf={confidence:.1f})")
+            else:
+                assigned_player_ids.add(p_id)
+                detected_faces.append({
+                    "player_id": p_id,
+                    "center": face_center,
+                    "rect": (x, y, w, h)
+                })
+                # Re-train LBPH online with confident updates
+                if confidence < 60.0:
+                    self.recognizer.update([roi_resized], np.array([p_id]))
+
+        # Draw dynamic bounding boxes on the annotated frame
+        if result.annotated_image is not None and detected_faces:
+            for face in detected_faces:
+                p_id = face["player_id"]
+                x, y, w, h = face["rect"]
+                player = self.players.get(p_id)
+                color = player.color if player else (255, 255, 255)
+                cv2.rectangle(result.annotated_image, (x, y), (x + w, y + h), color, 2, cv2.LINE_AA)
+                cv2.putText(
+                    result.annotated_image,
+                    f"Player {p_id}",
+                    (x, y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    1,
+                    cv2.LINE_AA
+                )
+
+        # ── 2. Extract Motion Candidates ─────────────────────────────────────
         candidates = []
         if self.mode == "hand":
             for hand in result.hands:
@@ -353,7 +437,6 @@ class MotionAnalyzer:
                 ]
                 center = np.mean(pts, axis=0)
                 scale = np.linalg.norm(hand.wrist.as_array() - hand.middle_mcp.as_array())
-
                 candidates.append({
                     "center": center,
                     "scale": scale,
@@ -367,7 +450,6 @@ class MotionAnalyzer:
                 r_sh = pose.right_shoulder.as_array()
                 center = (l_sh + r_sh) / 2.0
                 scale = np.linalg.norm(l_sh - r_sh)
-
                 candidates.append({
                     "center": center,
                     "scale": scale,
@@ -376,44 +458,70 @@ class MotionAnalyzer:
                     "landmarks": pose
                 })
 
-        # 2. Group candidates by spatial slot
-        slot_candidates = {i: [] for i in range(self.num_slots)}
-        for cand in candidates:
-            # Determine slot by X coordinate (normalized 0 to 1)
-            cx = cand["center"][0]
-            slot_idx = int(cx * self.num_slots)
-            slot_idx = max(0, min(self.num_slots - 1, slot_idx))
-            slot_candidates[slot_idx].append(cand)
+        # ── 3. Greedy Matching ───────────────────────────────────────────────
+        match_options = []
+        for c_idx, cand in enumerate(candidates):
+            for p_id, player in self.players.items():
+                face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
+                if face_match is not None:
+                    dist_face = np.linalg.norm(cand["center"] - face_match["center"])
+                    dist_prev = np.linalg.norm(cand["center"] - player.center)
+                    dist = min(dist_face, dist_prev)
+                else:
+                    dist = np.linalg.norm(cand["center"] - player.center)
+                    dist += 0.1  # penalty for missing face
 
-        # 3. Update each player slot
-        for slot_idx in range(self.num_slots):
-            p_id = slot_idx + 1
+                match_options.append((c_idx, p_id, dist))
+
+        match_options.sort(key=lambda x: x[2])
+        matched_candidates = set()
+        matched_players = set()
+
+        for c_idx, p_id, dist in match_options:
+            if c_idx in matched_candidates or p_id in matched_players:
+                continue
+            if dist > 0.5:
+                continue
+
+            matched_candidates.add(c_idx)
+            matched_players.add(p_id)
+
+            cand = candidates[c_idx]
             player = self.players[p_id]
-            cands = slot_candidates[slot_idx]
+            player.center = cand["center"]
+            
+            face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
+            if face_match is not None:
+                player.last_seen_face_center = face_match["center"]
 
-            if cands:
-                # If multiple candidates fall in the same slot (e.g. 2 hands for 1 player),
-                # pick the one with highest activity (most movement).
-                cands.sort(key=lambda x: np.linalg.norm(x["center"] - player.center))
-                cand = cands[0]
-                player.center = cand["center"]
-                player.update_motion(
-                    left_y=cand["left_y"],
-                    right_y=cand["right_y"],
-                    scale=cand["scale"],
-                    adaptive=self.adaptive_thresholds,
-                    landmarks=cand["landmarks"]
-                )
-            else:
-                player.tick_lost()
+            player.update_motion(
+                left_y=cand["left_y"],
+                right_y=cand["right_y"],
+                scale=cand["scale"],
+                adaptive=self.adaptive_thresholds,
+                landmarks=cand["landmarks"]
+            )
 
-        # 4. Return results
+        # ── 4. Handle Unmatched Players ──────────────────────────────────────
+        for p_id, player in self.players.items():
+            if p_id in matched_players:
+                continue
+            
+            player.tick_lost()
+            
+            # If their face is still visible, keep them active (not Away)
+            face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
+            if face_match is not None:
+                player.center = face_match["center"]
+                player.last_seen_face_center = face_match["center"]
+                player.last_seen = time.time()
+
+        # ── 5. Assemble Results ──────────────────────────────────────────────
         active_list = list(self.players.values())
-        
-        # Determine if any player is actively tracked this frame
+        if not active_list:
+            return MotionFeatures(detected=False, players=[])
+
         any_tracked = any(p.rep_counter._tracking for p in active_list)
-        
-        # Pick the most active player
         best_player = max(active_list, key=lambda x: x.activity)
         any_rep = any(p.rep_completed_this_frame for p in active_list)
 
@@ -428,13 +536,9 @@ class MotionAnalyzer:
         )
 
     def reset(self):
-        """Reset all player scores and rebuild the player mapping."""
+        """Reset all player scores and rebuild the face models for a fresh session."""
         self.players.clear()
-        for i in range(1, self.num_slots + 1):
-            cx = (2 * i - 1) / (2 * self.num_slots)
-            self.players[i] = TrackedPlayer(
-                player_id=i,
-                center=np.array([cx, 0.5]),
-                tracking_mode=self.mode,
-                det_kw=self.det_kw
-            )
+        self.next_player_id = 1
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+        self.recognizer_trained = False
+        print("[MotionAnalyzer] Session score and face models reset.")

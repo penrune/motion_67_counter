@@ -86,6 +86,7 @@ class LandmarkResult:
     hands: list[HandLandmarks] = field(default_factory=list)
     poses: list[PoseLandmarks] = field(default_factory=list)
     annotated_image: Optional[np.ndarray] = None
+    raw_image: Optional[np.ndarray] = None
     detected: bool = False
 
     @property
@@ -191,7 +192,7 @@ class LandmarkTracker:
         annotated = bgr.copy()
 
         if not result.hand_landmarks:
-            return LandmarkResult(mode="hand", detected=False, annotated_image=annotated)
+            return LandmarkResult(mode="hand", detected=False, annotated_image=annotated, raw_image=bgr)
 
         hands: list[HandLandmarks] = []
 
@@ -218,7 +219,7 @@ class LandmarkTracker:
             hands.append(hand)
 
         return LandmarkResult(
-            mode="hand", hands=hands, detected=True, annotated_image=annotated
+            mode="hand", hands=hands, detected=True, annotated_image=annotated, raw_image=bgr
         )
 
     # ── Pose mode ─────────────────────────────────────────────────────────
@@ -230,7 +231,7 @@ class LandmarkTracker:
         annotated = bgr.copy()
 
         if not result.pose_landmarks:
-            return LandmarkResult(mode="pose", detected=False, annotated_image=annotated)
+            return LandmarkResult(mode="pose", detected=False, annotated_image=annotated, raw_image=bgr)
 
         poses: list[PoseLandmarks] = []
         for lm in result.pose_landmarks:
@@ -256,7 +257,7 @@ class LandmarkTracker:
             poses.append(pose)
 
         return LandmarkResult(
-            mode="pose", poses=poses, detected=True, annotated_image=annotated
+            mode="pose", poses=poses, detected=True, annotated_image=annotated, raw_image=bgr
         )
 
     def close(self):

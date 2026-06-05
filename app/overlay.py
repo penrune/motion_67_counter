@@ -144,15 +144,15 @@ class Overlay:
 
         # ── Draw Top-Right Leaderboard Panel ───────────────────────────────
         if players:
+            # Sort players by score, showing top 5
+            sorted_players = sorted(players, key=lambda x: x.rep_counter.count, reverse=True)[:5]
+            
             leaderboard_w = 200
-            leaderboard_h = 35 + len(players) * 35
+            leaderboard_h = 35 + len(sorted_players) * 35
             self._draw_panel(out, w - leaderboard_w - 10, 10, leaderboard_w, leaderboard_h, alpha=0.65)
 
             cv2.putText(out, "LEADERBOARD", (w - leaderboard_w, 32),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, _YELLOW, 2, cv2.LINE_AA)
-
-            # Sort players by score
-            sorted_players = sorted(players, key=lambda x: x.rep_counter.count, reverse=True)
             for idx, p in enumerate(sorted_players):
                 y_pos = 65 + idx * 35
                 p_color = p.color if p.rep_counter._tracking else _DIM
