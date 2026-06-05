@@ -180,6 +180,7 @@ class TrackedPlayer:
         self.activity: float = 0.0
         self.rep_completed_this_frame: bool = False
         self.last_landmarks = None
+        self.last_landmarks_list = []
 
     def _get_color(self, idx: int) -> tuple[int, int, int]:
         colors = [
@@ -192,9 +193,10 @@ class TrackedPlayer:
         ]
         return colors[(idx - 1) % len(colors)]
 
-    def update_motion(self, left_y: Optional[float], right_y: Optional[float], scale: float, adaptive: bool, landmarks=None):
+    def update_motion(self, left_y: Optional[float], right_y: Optional[float], scale: float, adaptive: bool, landmarks_list=None):
         self.last_seen = time.time()
-        self.last_landmarks = landmarks
+        self.last_landmarks_list = landmarks_list or []
+        self.last_landmarks = landmarks_list[0] if landmarks_list else None
 
         base_amp = self.det_kw.get("min_amplitude", 0.08)
         if adaptive and scale > 0:
@@ -247,6 +249,8 @@ class TrackedPlayer:
             d.tick()
         self.activity *= 0.95
         self.rep_completed_this_frame = False
+        self.last_landmarks_list = []
+        self.last_landmarks = None
         
         dummy_features = MotionFeatures(detected=False)
         self.rep_counter.update(dummy_features)
@@ -311,17 +315,33 @@ class MotionAnalyzer:
 
         # ── 1. Detect and Identify Faces ─────────────────────────────────────
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(
+        faces_detected = self.face_cascade.detectMultiScale(
             gray,
             scaleFactor=1.1,
             minNeighbors=5,
             minSize=(45, 45)
         )
 
-        detected_faces = []
-        predictions = []
+        # Apply Non-Maximum Suppression (NMS) to eliminate duplicate overlapping boxes
+        faces = []
+        for (x, y, w, h) in faces_detected:
+            cx = x + w/2
+            cy = y + h/2
+            is_duplicate = False
+            for (ux, uy, uw, uh) in faces:
+                ucx = ux + uw/2
+                ucy = uy + uh/2
+                dist = np.sqrt((cx - ucx)**2 + (cy - ucy)**2)
+                if dist < max(w, uw) * 0.5:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                faces.append((x, y, w, h))
 
-        for (x, y, w, h) in faces:
+        detected_faces = []
+        face_detections = []
+
+        for idx, (x, y, w, h) in enumerate(faces):
             fcx = (x + w/2) / frame.shape[1]
             fcy = (y + h/2) / frame.shape[0]
             face_center = np.array([fcx, fcy])
@@ -330,81 +350,91 @@ class MotionAnalyzer:
             roi_resized = cv2.resize(roi, (100, 100))
 
             if not self.recognizer_trained:
-                # First face: enroll Player 1
-                p_id = self.next_player_id
-                self.next_player_id += 1
+                predicted_id = -1
+                confidence = 999.0
+            else:
+                predicted_id, confidence = self.recognizer.predict(roi_resized)
                 
-                self.players[p_id] = TrackedPlayer(
-                    player_id=p_id,
-                    center=face_center,
-                    tracking_mode=self.mode,
-                    det_kw=self.det_kw
-                )
-                self.players[p_id].last_seen_face_center = face_center
-                
-                self.recognizer.train([roi_resized], np.array([p_id]))
+            face_detections.append({
+                "idx": idx,
+                "rect": (x, y, w, h),
+                "center": face_center,
+                "predicted_id": predicted_id,
+                "confidence": confidence,
+                "roi": roi_resized
+            })
+
+        # Match face detections to players using Cost-Based Greedy Matching
+        # Cost = spatial_distance - 0.4 (if ID matches and confidence <= threshold)
+        face_match_options = []
+        for f_det in face_detections:
+            for p_id, player in self.players.items():
+                dist = np.linalg.norm(f_det["center"] - player.center)
+                cost = dist
+                if f_det["predicted_id"] == p_id and f_det["confidence"] <= self.face_recognition_threshold:
+                    cost -= 0.4
+                face_match_options.append((f_det["idx"], p_id, cost))
+
+        face_match_options.sort(key=lambda x: x[2])
+        matched_face_indices = set()
+        matched_player_ids = set()
+
+        for f_idx, p_id, cost in face_match_options:
+            if f_idx in matched_face_indices or p_id in matched_player_ids:
+                continue
+
+            f_det = face_detections[f_idx]
+            is_confident_face = (f_det["predicted_id"] == p_id and f_det["confidence"] <= self.face_recognition_threshold)
+            spatial_dist = np.linalg.norm(f_det["center"] - self.players[p_id].center)
+
+            # Accept match if face recognized or spatial distance is very small
+            if is_confident_face or spatial_dist <= 0.35:
+                matched_face_indices.add(f_idx)
+                matched_player_ids.add(p_id)
+
+                player = self.players[p_id]
+                player.center = f_det["center"]
+                player.last_seen_face_center = f_det["center"]
+                player.last_seen = time.time()
+
+                detected_faces.append({
+                    "player_id": p_id,
+                    "center": f_det["center"],
+                    "rect": f_det["rect"]
+                })
+
+                if f_det["confidence"] < 60.0:
+                    self.recognizer.update([f_det["roi"]], np.array([p_id]))
+
+        # Enroll unmatched face detections as new players
+        for f_det in face_detections:
+            if f_det["idx"] in matched_face_indices:
+                continue
+
+            new_id = self.next_player_id
+            self.next_player_id += 1
+
+            self.players[new_id] = TrackedPlayer(
+                player_id=new_id,
+                center=f_det["center"],
+                tracking_mode=self.mode,
+                det_kw=self.det_kw
+            )
+            self.players[new_id].last_seen_face_center = f_det["center"]
+            self.players[new_id].last_seen = time.time()
+
+            if not self.recognizer_trained:
+                self.recognizer.train([f_det["roi"]], np.array([new_id]))
                 self.recognizer_trained = True
-                
-                predictions.append({
-                    "player_id": p_id,
-                    "confidence": 0.0,
-                    "center": face_center,
-                    "rect": (x, y, w, h),
-                    "roi": roi_resized
-                })
             else:
-                p_id, confidence = self.recognizer.predict(roi_resized)
-                predictions.append({
-                    "player_id": p_id,
-                    "confidence": confidence,
-                    "center": face_center,
-                    "rect": (x, y, w, h),
-                    "roi": roi_resized
-                })
+                self.recognizer.update([f_det["roi"]], np.array([new_id]))
 
-        # Resolve duplicate predictions and enroll new players
-        predictions.sort(key=lambda x: x["confidence"])
-        assigned_player_ids = set()
-
-        for pred in predictions:
-            p_id = pred["player_id"]
-            confidence = pred["confidence"]
-            face_center = pred["center"]
-            x, y, w, h = pred["rect"]
-            roi_resized = pred["roi"]
-
-            if p_id in assigned_player_ids or confidence > self.face_recognition_threshold:
-                # Unrecognized face or ID conflict: Enroll a new player
-                new_id = self.next_player_id
-                self.next_player_id += 1
-                
-                self.players[new_id] = TrackedPlayer(
-                    player_id=new_id,
-                    center=face_center,
-                    tracking_mode=self.mode,
-                    det_kw=self.det_kw
-                )
-                self.players[new_id].last_seen_face_center = face_center
-                
-                self.recognizer.update([roi_resized], np.array([new_id]))
-                assigned_player_ids.add(new_id)
-                
-                detected_faces.append({
-                    "player_id": new_id,
-                    "center": face_center,
-                    "rect": (x, y, w, h)
-                })
-                print(f"[MotionAnalyzer] Enrolled Player {new_id} dynamically (conf={confidence:.1f})")
-            else:
-                assigned_player_ids.add(p_id)
-                detected_faces.append({
-                    "player_id": p_id,
-                    "center": face_center,
-                    "rect": (x, y, w, h)
-                })
-                # Re-train LBPH online with confident updates
-                if confidence < 60.0:
-                    self.recognizer.update([roi_resized], np.array([p_id]))
+            detected_faces.append({
+                "player_id": new_id,
+                "center": f_det["center"],
+                "rect": f_det["rect"]
+            })
+            print(f"[MotionAnalyzer] Enrolled Player {new_id} dynamically (predicted={f_det['predicted_id']}, conf={f_det['confidence']:.1f})")
 
         # Draw dynamic bounding boxes on the annotated frame
         if result.annotated_image is not None and detected_faces:
@@ -458,63 +488,67 @@ class MotionAnalyzer:
                     "landmarks": pose
                 })
 
-        # ── 3. Greedy Matching ───────────────────────────────────────────────
-        match_options = []
-        for c_idx, cand in enumerate(candidates):
+        # ── 3. Candidate-to-Player Proximity Mapping ─────────────────────────
+        # Hand candidates are matched to the closest active player.
+        # This allows multiple hand candidates (e.g. left and right hand) to map to a single player.
+        player_candidates = {p_id: [] for p_id in self.players}
+
+        for cand in candidates:
+            best_p_id = None
+            min_dist = float('inf')
+            
             for p_id, player in self.players.items():
+                # Measure distance to player's center or their face center
+                dist_prev = np.linalg.norm(cand["center"] - player.center)
+                dist_face = float('inf')
                 face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
                 if face_match is not None:
                     dist_face = np.linalg.norm(cand["center"] - face_match["center"])
-                    dist_prev = np.linalg.norm(cand["center"] - player.center)
-                    dist = min(dist_face, dist_prev)
-                else:
-                    dist = np.linalg.norm(cand["center"] - player.center)
-                    dist += 0.1  # penalty for missing face
+                
+                dist = min(dist_prev, dist_face)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_p_id = p_id
 
-                match_options.append((c_idx, p_id, dist))
+            if best_p_id is not None and min_dist <= 0.45:
+                player_candidates[best_p_id].append(cand)
 
-        match_options.sort(key=lambda x: x[2])
-        matched_candidates = set()
-        matched_players = set()
-
-        for c_idx, p_id, dist in match_options:
-            if c_idx in matched_candidates or p_id in matched_players:
-                continue
-            if dist > 0.5:
-                continue
-
-            matched_candidates.add(c_idx)
-            matched_players.add(p_id)
-
-            cand = candidates[c_idx]
-            player = self.players[p_id]
-            player.center = cand["center"]
-            
-            face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
-            if face_match is not None:
-                player.last_seen_face_center = face_match["center"]
-
-            player.update_motion(
-                left_y=cand["left_y"],
-                right_y=cand["right_y"],
-                scale=cand["scale"],
-                adaptive=self.adaptive_thresholds,
-                landmarks=cand["landmarks"]
-            )
-
-        # ── 4. Handle Unmatched Players ──────────────────────────────────────
+        # ── 4. Update Player Motion States ───────────────────────────────────
         for p_id, player in self.players.items():
-            if p_id in matched_players:
-                continue
-            
-            player.tick_lost()
-            
-            # If their face is still visible, keep them active (not Away)
-            face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
-            if face_match is not None:
-                player.center = face_match["center"]
-                player.last_seen_face_center = face_match["center"]
-                player.last_seen = time.time()
+            cands = player_candidates[p_id]
+            if cands:
+                if self.mode == "hand":
+                    # If player has multiple hands, sort them from left to right (X coordinate)
+                    cands.sort(key=lambda x: x["center"][0])
+                    player.center = np.mean([c["center"] for c in cands], axis=0)
+                    
+                    # Store both hands in the landmarks list
+                    player.update_motion(
+                        left_y=cands[0]["left_y"],
+                        right_y=cands[1]["left_y"] if len(cands) > 1 else None,
+                        scale=cands[0]["scale"],
+                        adaptive=self.adaptive_thresholds,
+                        landmarks_list=[c["landmarks"] for c in cands]
+                    )
+                else:  # pose mode
+                    # Pose mode has exactly 1 candidate representing the person
+                    cand = cands[0]
+                    player.center = cand["center"]
+                    player.update_motion(
+                        left_y=cand["left_y"],
+                        right_y=cand["right_y"],
+                        scale=cand["scale"],
+                        adaptive=self.adaptive_thresholds,
+                        landmarks_list=[cand["landmarks"]]
+                    )
+            else:
+                player.tick_lost()
+                # If face is still detected in this frame, update center position so they don't timeout
+                face_match = next((f for f in detected_faces if f["player_id"] == p_id), None)
+                if face_match is not None:
+                    player.center = face_match["center"]
+                    player.last_seen_face_center = face_match["center"]
+                    player.last_seen = time.time()
 
         # ── 5. Assemble Results ──────────────────────────────────────────────
         active_list = list(self.players.values())

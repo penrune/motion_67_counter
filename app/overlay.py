@@ -71,64 +71,70 @@ class Overlay:
 
         # ── Draw Player-Specific Skeletons & Floating HUDs ─────────────────
         if players:
+            import time
             for p in players:
                 if not p.rep_counter._tracking:
-                    continue
-                lm = p.last_landmarks
-                if not lm:
                     continue
 
                 # Draw player-specific skeletal connections
                 if self.tracking_mode == "pose":
-                    sh_left = (int(lm.left_shoulder.x * w), int(lm.left_shoulder.y * h))
-                    sh_right = (int(lm.right_shoulder.x * w), int(lm.right_shoulder.y * h))
-                    cv2.line(out, sh_left, sh_right, p.color, 3, cv2.LINE_AA)
+                    lm = p.last_landmarks
+                    if lm:
+                        sh_left = (int(lm.left_shoulder.x * w), int(lm.left_shoulder.y * h))
+                        sh_right = (int(lm.right_shoulder.x * w), int(lm.right_shoulder.y * h))
+                        cv2.line(out, sh_left, sh_right, p.color, 3, cv2.LINE_AA)
 
-                    if lm.left_elbow and lm.left_wrist:
-                        el_left = (int(lm.left_elbow.x * w), int(lm.left_elbow.y * h))
-                        wr_left = (int(lm.left_wrist.x * w), int(lm.left_wrist.y * h))
-                        cv2.line(out, sh_left, el_left, p.color, 3, cv2.LINE_AA)
-                        cv2.line(out, el_left, wr_left, p.color, 3, cv2.LINE_AA)
-                        cv2.circle(out, el_left, 6, p.color, -1)
-                        cv2.circle(out, wr_left, 6, p.color, -1)
+                        if lm.left_elbow and lm.left_wrist:
+                            el_left = (int(lm.left_elbow.x * w), int(lm.left_elbow.y * h))
+                            wr_left = (int(lm.left_wrist.x * w), int(lm.left_wrist.y * h))
+                            cv2.line(out, sh_left, el_left, p.color, 3, cv2.LINE_AA)
+                            cv2.line(out, el_left, wr_left, p.color, 3, cv2.LINE_AA)
+                            cv2.circle(out, el_left, 6, p.color, -1)
+                            cv2.circle(out, wr_left, 6, p.color, -1)
 
-                    if lm.right_elbow and lm.right_wrist:
-                        el_right = (int(lm.right_elbow.x * w), int(lm.right_elbow.y * h))
-                        wr_right = (int(lm.right_wrist.x * w), int(lm.right_wrist.y * h))
-                        cv2.line(out, sh_right, el_right, p.color, 3, cv2.LINE_AA)
-                        cv2.line(out, el_right, wr_right, p.color, 3, cv2.LINE_AA)
-                        cv2.circle(out, el_right, 6, p.color, -1)
-                        cv2.circle(out, wr_right, 6, p.color, -1)
+                        if lm.right_elbow and lm.right_wrist:
+                            el_right = (int(lm.right_elbow.x * w), int(lm.right_elbow.y * h))
+                            wr_right = (int(lm.right_wrist.x * w), int(lm.right_wrist.y * h))
+                            cv2.line(out, sh_right, el_right, p.color, 3, cv2.LINE_AA)
+                            cv2.line(out, el_right, wr_right, p.color, 3, cv2.LINE_AA)
+                            cv2.circle(out, el_right, 6, p.color, -1)
+                            cv2.circle(out, wr_right, 6, p.color, -1)
 
-                    cv2.circle(out, sh_left, 6, p.color, -1)
-                    cv2.circle(out, sh_right, 6, p.color, -1)
-
-                    # Floating tag positioning (overhead)
-                    tag_x = int(p.center[0] * w)
-                    tag_y = int(min(lm.left_shoulder.y, lm.right_shoulder.y) * h) - 35
-
+                        cv2.circle(out, sh_left, 6, p.color, -1)
+                        cv2.circle(out, sh_right, 6, p.color, -1)
                 else:  # hand mode
-                    wr = (int(lm.wrist.x * w), int(lm.wrist.y * h))
-                    t_cmc = (int(lm.thumb_cmc.x * w), int(lm.thumb_cmc.y * h))
-                    t_tip = (int(lm.thumb_tip.x * w), int(lm.thumb_tip.y * h))
-                    i_mcp = (int(lm.index_mcp.x * w), int(lm.index_mcp.y * h))
-                    i_tip = (int(lm.index_tip.x * w), int(lm.index_tip.y * h))
-                    m_mcp = (int(lm.middle_mcp.x * w), int(lm.middle_mcp.y * h))
-                    m_tip = (int(lm.middle_tip.x * w), int(lm.middle_tip.y * h))
+                    lms = getattr(p, "last_landmarks_list", []) or ([p.last_landmarks] if p.last_landmarks else [])
+                    for lm in lms:
+                        wr = (int(lm.wrist.x * w), int(lm.wrist.y * h))
+                        t_cmc = (int(lm.thumb_cmc.x * w), int(lm.thumb_cmc.y * h))
+                        t_tip = (int(lm.thumb_tip.x * w), int(lm.thumb_tip.y * h))
+                        i_mcp = (int(lm.index_mcp.x * w), int(lm.index_mcp.y * h))
+                        i_tip = (int(lm.index_tip.x * w), int(lm.index_tip.y * h))
+                        m_mcp = (int(lm.middle_mcp.x * w), int(lm.middle_mcp.y * h))
+                        m_tip = (int(lm.middle_tip.x * w), int(lm.middle_tip.y * h))
 
-                    cv2.line(out, wr, t_cmc, p.color, 2, cv2.LINE_AA)
-                    cv2.line(out, t_cmc, t_tip, p.color, 2, cv2.LINE_AA)
-                    cv2.line(out, wr, i_mcp, p.color, 2, cv2.LINE_AA)
-                    cv2.line(out, i_mcp, i_tip, p.color, 2, cv2.LINE_AA)
-                    cv2.line(out, wr, m_mcp, p.color, 2, cv2.LINE_AA)
-                    cv2.line(out, m_mcp, m_tip, p.color, 2, cv2.LINE_AA)
+                        cv2.line(out, wr, t_cmc, p.color, 2, cv2.LINE_AA)
+                        cv2.line(out, t_cmc, t_tip, p.color, 2, cv2.LINE_AA)
+                        cv2.line(out, wr, i_mcp, p.color, 2, cv2.LINE_AA)
+                        cv2.line(out, i_mcp, i_tip, p.color, 2, cv2.LINE_AA)
+                        cv2.line(out, wr, m_mcp, p.color, 2, cv2.LINE_AA)
+                        cv2.line(out, m_mcp, m_tip, p.color, 2, cv2.LINE_AA)
 
-                    for pt in [wr, t_cmc, t_tip, i_mcp, i_tip, m_mcp, m_tip]:
-                        cv2.circle(out, pt, 5, p.color, -1)
+                        for pt in [wr, t_cmc, t_tip, i_mcp, i_tip, m_mcp, m_tip]:
+                            cv2.circle(out, pt, 5, p.color, -1)
 
-                    # Floating tag positioning (above hand)
+                # Floating tag positioning
+                face_center = getattr(p, "last_seen_face_center", None)
+                if face_center is not None and (time.time() - p.last_seen < 1.0):
+                    tag_x = int(face_center[0] * w)
+                    tag_y = int(face_center[1] * h) - 45
+                else:
                     tag_x = int(p.center[0] * w)
-                    tag_y = int(min(lm.wrist.y, lm.index_tip.y, lm.middle_tip.y) * h) - 25
+                    lm = p.last_landmarks
+                    if self.tracking_mode == "pose":
+                        tag_y = int(min(lm.left_shoulder.y, lm.right_shoulder.y) * h) - 35 if lm else int(p.center[1] * h) - 35
+                    else:
+                        tag_y = int(min(lm.wrist.y, lm.index_tip.y, lm.middle_tip.y) * h) - 25 if lm else int(p.center[1] * h) - 25
 
                 # Draw floating player score tag
                 tag_x = max(50, min(w - 50, tag_x))
