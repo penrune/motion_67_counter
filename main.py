@@ -158,6 +158,8 @@ def main():
     last_players = []
     last_features = None
 
+    cv2.namedWindow("67 Meme Counter", cv2.WINDOW_AUTOSIZE)
+
     # ── Main loop ─────────────────────────────────────────────────────────
     while True:
         frame = camera.read()
