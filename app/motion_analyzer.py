@@ -236,6 +236,8 @@ class TrackedPlayer:
         if adaptive and scale > 0:
             ref_scale = 0.20 if self.tracking_mode == "pose" else 0.12
             ratio = scale / ref_scale
+            if self.tracking_mode == "hand":
+                ratio = min(1.0, ratio)  # Don't scale up (make harder) for hands when close
             ratio = max(0.4, min(1.5, ratio))
             scaled_amp = base_amp * ratio
         else:
@@ -285,14 +287,18 @@ class TrackedPlayer:
             d.tick()
         self.activity *= 0.95
         self.rep_completed_this_frame = False
+        
+        # Signal tracking lost to the counter so it handles state properly
+        dummy_features = MotionFeatures(detected=False)
+        self.rep_counter.update(dummy_features)
 
 
 # ── Main analyser ──────────────────────────────────────────────────────────
 
 class MotionAnalyzer:
     """
-    Maintains multiple TrackedPlayers and routes detections to them.
-    Differentiates players by Horiz/Vert proximity using Euclidean distance.
+    Maintains a fixed set of TrackedPlayers corresponding to spatial screen slots (left to right).
+    Differentiates players by horizontal coordinate zones to keep IDs stable even if they exit the frame.
     """
 
     def __init__(
@@ -305,9 +311,9 @@ class MotionAnalyzer:
         adaptive_thresholds: bool = True,
         min_rep_interval: float = 0.2,
         lost_tracking_reset: float = 1.0,
+        max_players: int = 2,
     ):
         self.mode = mode
-        self.tracking_match_threshold = tracking_match_threshold
         self.adaptive_thresholds = adaptive_thresholds
 
         self.det_kw = dict(
@@ -316,29 +322,29 @@ class MotionAnalyzer:
             reversal_threshold=direction_reversal_threshold,
             min_rep_interval=min_rep_interval,
             lost_tracking_reset=lost_tracking_reset,
+            max_players=max_players,
         )
 
+        # Pre-initialize permanent slots/players (never deleted)
+        self.num_slots = max_players
         self.players: dict[int, TrackedPlayer] = {}
-        self.next_player_id = 1
+        self.reset()
 
     def analyze(self, result: LandmarkResult) -> MotionFeatures:
         """
         Process a list of hands/poses from the LandmarkResult.
-        Matches them to players, tracks coordinates, counts reps, and ages out lost tracked entities.
+        Assigns candidates to permanent spatial slots (Player 1, Player 2, etc.) based on X-coordinate.
         """
         if not result.detected:
             # Tick all players
-            for p in list(self.players.values()):
+            for p in self.players.values():
                 p.tick_lost()
-                if time.time() - p.last_seen > self.det_kw["lost_tracking_reset"]:
-                    del self.players[p.id]
-            return MotionFeatures(detected=False)
+            return MotionFeatures(detected=False, players=list(self.players.values()))
 
-        # 1. Get candidates with center position and scale
+        # 1. Extract candidates with center position and scale
         candidates = []
         if self.mode == "hand":
             for hand in result.hands:
-                # Average hand landmarks (wrist, CMC, index MCP, middle MCP) for stable center
                 pts = [
                     hand.wrist.as_array(),
                     hand.index_mcp.as_array(),
@@ -346,7 +352,6 @@ class MotionAnalyzer:
                     hand.thumb_cmc.as_array()
                 ]
                 center = np.mean(pts, axis=0)
-                # Hand scale: wrist to middle finger MCP
                 scale = np.linalg.norm(hand.wrist.as_array() - hand.middle_mcp.as_array())
 
                 candidates.append({
@@ -361,7 +366,6 @@ class MotionAnalyzer:
                 l_sh = pose.left_shoulder.as_array()
                 r_sh = pose.right_shoulder.as_array()
                 center = (l_sh + r_sh) / 2.0
-                # Shoulder scale: distance between left and right shoulders
                 scale = np.linalg.norm(l_sh - r_sh)
 
                 candidates.append({
@@ -372,78 +376,49 @@ class MotionAnalyzer:
                     "landmarks": pose
                 })
 
-        # 2. Greedy bipartite matching
-        matched_candidates = set()
-        matched_players = set()
+        # 2. Group candidates by spatial slot
+        slot_candidates = {i: [] for i in range(self.num_slots)}
+        for cand in candidates:
+            # Determine slot by X coordinate (normalized 0 to 1)
+            cx = cand["center"][0]
+            slot_idx = int(cx * self.num_slots)
+            slot_idx = max(0, min(self.num_slots - 1, slot_idx))
+            slot_candidates[slot_idx].append(cand)
 
-        pairs = []
-        for c_idx, cand in enumerate(candidates):
-            for p_id, player in self.players.items():
-                dist = np.linalg.norm(cand["center"] - player.center)
-                pairs.append((dist, c_idx, p_id))
+        # 3. Update each player slot
+        for slot_idx in range(self.num_slots):
+            p_id = slot_idx + 1
+            player = self.players[p_id]
+            cands = slot_candidates[slot_idx]
 
-        # Sort pairs by distance
-        pairs.sort(key=lambda x: x[0])
-
-        for dist, c_idx, p_id in pairs:
-            if c_idx in matched_candidates or p_id in matched_players:
-                continue
-            if dist < self.tracking_match_threshold:
-                matched_candidates.add(c_idx)
-                matched_players.add(p_id)
-
-                # Update matched player
-                player = self.players[p_id]
-                player.center = candidates[c_idx]["center"]
+            if cands:
+                # If multiple candidates fall in the same slot (e.g. 2 hands for 1 player),
+                # pick the one with highest activity (most movement).
+                cands.sort(key=lambda x: np.linalg.norm(x["center"] - player.center))
+                cand = cands[0]
+                player.center = cand["center"]
                 player.update_motion(
-                    left_y=candidates[c_idx]["left_y"],
-                    right_y=candidates[c_idx]["right_y"],
-                    scale=candidates[c_idx]["scale"],
-                    adaptive=self.adaptive_thresholds,
-                    landmarks=candidates[c_idx]["landmarks"]
-                )
-
-        # 3. Create new players for unmatched candidates
-        for c_idx, cand in enumerate(candidates):
-            if c_idx not in matched_candidates:
-                new_id = self.next_player_id
-                self.next_player_id += 1
-                new_player = TrackedPlayer(
-                    player_id=new_id,
-                    center=cand["center"],
-                    tracking_mode=self.mode,
-                    det_kw=self.det_kw
-                )
-                new_player.update_motion(
                     left_y=cand["left_y"],
                     right_y=cand["right_y"],
                     scale=cand["scale"],
                     adaptive=self.adaptive_thresholds,
                     landmarks=cand["landmarks"]
                 )
-                self.players[new_id] = new_player
-
-        # 4. Tick unmatched players and remove aged out players
-        for p_id, player in list(self.players.items()):
-            if p_id not in matched_players:
+            else:
                 player.tick_lost()
-                if time.time() - player.last_seen > self.det_kw["lost_tracking_reset"]:
-                    del self.players[p_id]
 
-        # 5. Return results
+        # 4. Return results
         active_list = list(self.players.values())
-        if not active_list:
-            return MotionFeatures(detected=False)
-
-        # Sort by player ID for consistent UI display
-        active_list.sort(key=lambda x: x.id)
-
-        # For backward compatibility, pick the most active player
+        
+        # Determine if any player is actively tracked this frame
+        any_tracked = any(p.rep_counter._tracking for p in active_list)
+        
+        # Pick the most active player
         best_player = max(active_list, key=lambda x: x.activity)
         any_rep = any(p.rep_completed_this_frame for p in active_list)
 
         return MotionFeatures(
-            detected=True,
+            detected=any_tracked,
             wrist_y=best_player.wrist_y,
             direction=best_player.direction,
             amplitude=best_player.amplitude,
@@ -453,6 +428,13 @@ class MotionAnalyzer:
         )
 
     def reset(self):
-        """Reset all tracked players."""
+        """Reset all player scores and rebuild the player mapping."""
         self.players.clear()
-        self.next_player_id = 1
+        for i in range(1, self.num_slots + 1):
+            cx = (2 * i - 1) / (2 * self.num_slots)
+            self.players[i] = TrackedPlayer(
+                player_id=i,
+                center=np.array([cx, 0.5]),
+                tracking_mode=self.mode,
+                det_kw=self.det_kw
+            )

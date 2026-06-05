@@ -72,6 +72,8 @@ class Overlay:
         # ── Draw Player-Specific Skeletons & Floating HUDs ─────────────────
         if players:
             for p in players:
+                if not p.rep_counter._tracking:
+                    continue
                 lm = p.last_landmarks
                 if not lm:
                     continue
@@ -153,12 +155,17 @@ class Overlay:
             sorted_players = sorted(players, key=lambda x: x.rep_counter.count, reverse=True)
             for idx, p in enumerate(sorted_players):
                 y_pos = 65 + idx * 35
-                cv2.circle(out, (w - leaderboard_w + 12, y_pos - 5), 6, p.color, -1)
+                p_color = p.color if p.rep_counter._tracking else _DIM
+                cv2.circle(out, (w - leaderboard_w + 12, y_pos - 5), 6, p_color, -1)
 
                 p_text = f"{p.name}"
+                if not p.rep_counter._tracking:
+                    p_text += " (Away)"
                 score_text = f"{p.rep_counter.count}"
+                
+                text_color = _WHITE if p.rep_counter._tracking else _DIM
                 cv2.putText(out, p_text, (w - leaderboard_w + 26, y_pos),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, _WHITE, 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, text_color, 1, cv2.LINE_AA)
                 cv2.putText(out, score_text, (w - 40, y_pos),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, _GREEN, 2, cv2.LINE_AA)
 
