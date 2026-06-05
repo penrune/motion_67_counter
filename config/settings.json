@@ -2,11 +2,14 @@
   "camera_index": 0,
   "tracking_mode": "hand",
   "num_hands": 2,
-  "min_rep_interval_seconds": 0.3,
-  "smoothing_factor": 0.35,
+  "max_players": 4,
+  "min_rep_interval_seconds": 0.2,
+  "smoothing_factor": 0.45,
   "min_swing_amplitude": 0.08,
   "direction_reversal_threshold": 0.015,
   "lost_tracking_reset_seconds": 1.0,
+  "tracking_match_threshold": 0.25,
+  "adaptive_thresholds": true,
   "draw_landmarks": true,
   "save_sessions": true
 }

@@ -33,6 +33,7 @@ class SessionStorage:
         rep_count: int,
         tracking_mode: str,
         avg_fps: float,
+        player_reps: dict[str, int] | None = None,
     ):
         """Append a completed session record and write to disk."""
         if self._start_time is None:
@@ -50,6 +51,8 @@ class SessionStorage:
             "tracking_mode": tracking_mode,
             "avg_fps": round(avg_fps, 1),
         }
+        if player_reps:
+            record["player_reps"] = player_reps
 
         self._sessions.append(record)
         self._write()
