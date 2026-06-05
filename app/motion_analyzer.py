@@ -12,6 +12,8 @@ Detection pipeline:
   4. Two consecutive half-swings with sufficient amplitude = one rep
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 import time
 from typing import Optional
