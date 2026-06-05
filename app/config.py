@@ -13,8 +13,8 @@ CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.json"
 DEFAULTS = {
     "camera_index": 0,
     "tracking_mode": "hand",              # "hand" or "pose"
-    "num_hands": 4,                       # fallback for tracking_mode hand
-    "max_players": 4,                     # maximum number of players/poses to track
+    "num_hands": 10,                      # fallback for tracking_mode hand
+    "max_players": 10,                    # maximum number of players/poses to track
     "min_rep_interval_seconds": 0.2,      # lower cooldown (cooldown between counted reps) for faster motion
     "smoothing_factor": 0.45,             # higher EMA alpha (less lag, faster counting)
     "min_swing_amplitude": 0.08,          # base minimum wrist-Y travel to count a swing
