@@ -9,8 +9,10 @@ This module only applies:
 
 from __future__ import annotations
 import time
+from typing import TYPE_CHECKING
 
-from app.motion_analyzer import MotionFeatures
+if TYPE_CHECKING:
+    from app.motion_analyzer import MotionFeatures
 
 
 class RepCounter:

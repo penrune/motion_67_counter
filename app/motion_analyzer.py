@@ -20,6 +20,7 @@ from typing import Optional
 import numpy as np
 
 from app.landmark_tracker import LandmarkResult, HandLandmarks
+from app.counter import RepCounter
 
 
 # ── Output data ────────────────────────────────────────────────────────────
