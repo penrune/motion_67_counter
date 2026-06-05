@@ -12,10 +12,10 @@ Detection pipeline:
   4. Two consecutive half-swings with sufficient amplitude = one rep
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import time
 from typing import Optional
+import numpy as np
 
 from app.landmark_tracker import LandmarkResult, HandLandmarks
 
@@ -31,6 +31,7 @@ class MotionFeatures:
     amplitude: float = 0.0      # amplitude of last completed half-swing
     hand_count: int = 0          # number of hands/arms detected this frame
     rep_completed: bool = False  # True if a rep just completed this frame
+    players: list[TrackedPlayer] = field(default_factory=list)
 
 
 # ── Per-hand / per-arm swing detector ──────────────────────────────────────
@@ -168,139 +169,287 @@ class SwingDetector:
         self._reset_state()
 
 
+# ── Tracked Player Class ────────────────────────────────────────────────────
+
+class TrackedPlayer:
+    """
+    Tracks state, motion metrics, and rep count for a single person/hand.
+    """
+
+    def __init__(self, player_id: int, center: np.ndarray, tracking_mode: str, det_kw: dict):
+        self.id = player_id
+        self.name = f"Player {player_id}"
+        self.center = center
+        self.last_seen = time.time()
+        self.tracking_mode = tracking_mode
+        self.det_kw = det_kw
+
+        # Colors for visualization (BGR)
+        self.color = self._get_color(player_id)
+
+        # Swing detectors (0 = left hand/wrist/arm, 1 = right hand/wrist/arm)
+        # Note: in pose mode, we track both left and right wrists. In hand mode, we track wrist Y.
+        self.detectors = [
+            SwingDetector(
+                smoothing_factor=det_kw.get("smoothing_factor", 0.45),
+                min_amplitude=det_kw.get("min_amplitude", 0.08),
+                reversal_threshold=det_kw.get("reversal_threshold", 0.015)
+            ),
+            SwingDetector(
+                smoothing_factor=det_kw.get("smoothing_factor", 0.45),
+                min_amplitude=det_kw.get("min_amplitude", 0.08),
+                reversal_threshold=det_kw.get("reversal_threshold", 0.015)
+            )
+        ]
+
+        self.rep_counter = RepCounter(
+            min_rep_interval=det_kw.get("min_rep_interval", 0.2),
+            lost_tracking_reset=det_kw.get("lost_tracking_reset", 1.0)
+        )
+
+        self.wrist_y: float = 0.0
+        self.direction: str = "IDLE"
+        self.amplitude: float = 0.0
+        self.activity: float = 0.0
+        self.rep_completed_this_frame: bool = False
+        self.last_landmarks = None
+
+    def _get_color(self, idx: int) -> tuple[int, int, int]:
+        colors = [
+            (255, 100, 100),  # Bright Cyan/Blue (BGR)
+            (100, 255, 100),  # Bright Green
+            (100, 100, 255),  # Bright Red
+            (255, 100, 255),  # Bright Purple/Magenta
+            (255, 255, 100),  # Bright Yellow
+            (100, 255, 255),  # Bright Orange
+        ]
+        return colors[(idx - 1) % len(colors)]
+
+    def update_motion(self, left_y: Optional[float], right_y: Optional[float], scale: float, adaptive: bool, landmarks=None):
+        self.last_seen = time.time()
+        self.last_landmarks = landmarks
+
+        base_amp = self.det_kw.get("min_amplitude", 0.08)
+        if adaptive and scale > 0:
+            ref_scale = 0.20 if self.tracking_mode == "pose" else 0.12
+            ratio = scale / ref_scale
+            ratio = max(0.4, min(1.5, ratio))
+            scaled_amp = base_amp * ratio
+        else:
+            scaled_amp = base_amp
+
+        # Update both detectors with the possibly scaled amplitude threshold
+        for d in self.detectors:
+            d.min_amp = scaled_amp
+
+        l_rep, l_dir, l_amp = False, "IDLE", 0.0
+        if left_y is not None:
+            l_rep, l_dir, l_amp = self.detectors[0].update(left_y)
+        else:
+            self.detectors[0].tick()
+
+        r_rep, r_dir, r_amp = False, "IDLE", 0.0
+        if right_y is not None:
+            r_rep, r_dir, r_amp = self.detectors[1].update(right_y)
+        else:
+            self.detectors[1].tick()
+
+        # Update player display features (wrist_y, direction, amplitude, activity)
+        # using the more active detector/arm
+        if self.detectors[0].activity >= self.detectors[1].activity:
+            self.direction = l_dir
+            self.amplitude = l_amp
+            self.wrist_y = self.detectors[0].smooth_y or (left_y if left_y is not None else 0.0)
+            self.activity = self.detectors[0].activity
+        else:
+            self.direction = r_dir
+            self.amplitude = r_amp
+            self.wrist_y = self.detectors[1].smooth_y or (right_y if right_y is not None else 0.0)
+            self.activity = self.detectors[1].activity
+
+        # Feed the rep counter
+        dummy_features = MotionFeatures(
+            detected=True,
+            wrist_y=self.wrist_y,
+            direction=self.direction,
+            amplitude=self.amplitude,
+            rep_completed=(l_rep or r_rep)
+        )
+        self.rep_completed_this_frame = self.rep_counter.update(dummy_features)
+
+    def tick_lost(self):
+        for d in self.detectors:
+            d.tick()
+        self.activity *= 0.95
+        self.rep_completed_this_frame = False
+
+
 # ── Main analyser ──────────────────────────────────────────────────────────
 
 class MotionAnalyzer:
     """
-    Converts landmark data into motion features and detects 67 reps.
-
-    For **hand mode**: maintains two SwingDetectors assigned by horizontal
-    position (left/right side of frame).  Each detected hand is routed
-    to the nearest detector so hands can be tracked independently.
-
-    For **pose mode**: maintains two SwingDetectors, one per arm (left
-    wrist, right wrist).
+    Maintains multiple TrackedPlayers and routes detections to them.
+    Differentiates players by Horiz/Vert proximity using Euclidean distance.
     """
 
     def __init__(
         self,
         mode: str = "hand",
-        smoothing_factor: float = 0.35,
+        smoothing_factor: float = 0.45,
         min_swing_amplitude: float = 0.08,
         direction_reversal_threshold: float = 0.015,
+        tracking_match_threshold: float = 0.25,
+        adaptive_thresholds: bool = True,
+        min_rep_interval: float = 0.2,
+        lost_tracking_reset: float = 1.0,
     ):
         self.mode = mode
-        self._det_kw = dict(
+        self.tracking_match_threshold = tracking_match_threshold
+        self.adaptive_thresholds = adaptive_thresholds
+
+        self.det_kw = dict(
             smoothing_factor=smoothing_factor,
             min_amplitude=min_swing_amplitude,
             reversal_threshold=direction_reversal_threshold,
+            min_rep_interval=min_rep_interval,
+            lost_tracking_reset=lost_tracking_reset,
         )
-        # index 0 = left side of frame, index 1 = right side
-        self._detectors: list[SwingDetector] = [
-            SwingDetector(**self._det_kw),
-            SwingDetector(**self._det_kw),
-        ]
-        self._active_idx: int = 0
 
-    # ── public API ─────────────────────────────────────────────────────────
+        self.players: dict[int, TrackedPlayer] = {}
+        self.next_player_id = 1
 
     def analyze(self, result: LandmarkResult) -> MotionFeatures:
         """
-        Process one frame of landmarks.
-
-        Returns a MotionFeatures object.  ``rep_completed`` will be True
-        if any tracked hand/arm just finished a full oscillation cycle.
+        Process a list of hands/poses from the LandmarkResult.
+        Matches them to players, tracks coordinates, counts reps, and ages out lost tracked entities.
         """
         if not result.detected:
-            for d in self._detectors:
-                d.tick()
+            # Tick all players
+            for p in list(self.players.values()):
+                p.tick_lost()
+                if time.time() - p.last_seen > self.det_kw["lost_tracking_reset"]:
+                    del self.players[p.id]
             return MotionFeatures(detected=False)
 
+        # 1. Get candidates with center position and scale
+        candidates = []
         if self.mode == "hand":
-            return self._analyze_hands(result)
-        return self._analyze_pose(result)
+            for hand in result.hands:
+                # Average hand landmarks (wrist, CMC, index MCP, middle MCP) for stable center
+                pts = [
+                    hand.wrist.as_array(),
+                    hand.index_mcp.as_array(),
+                    hand.middle_mcp.as_array(),
+                    hand.thumb_cmc.as_array()
+                ]
+                center = np.mean(pts, axis=0)
+                # Hand scale: wrist to middle finger MCP
+                scale = np.linalg.norm(hand.wrist.as_array() - hand.middle_mcp.as_array())
+
+                candidates.append({
+                    "center": center,
+                    "scale": scale,
+                    "left_y": hand.wrist.y,
+                    "right_y": None,
+                    "landmarks": hand
+                })
+        else:  # pose mode
+            for pose in result.poses:
+                l_sh = pose.left_shoulder.as_array()
+                r_sh = pose.right_shoulder.as_array()
+                center = (l_sh + r_sh) / 2.0
+                # Shoulder scale: distance between left and right shoulders
+                scale = np.linalg.norm(l_sh - r_sh)
+
+                candidates.append({
+                    "center": center,
+                    "scale": scale,
+                    "left_y": pose.left_wrist.y if pose.left_wrist else None,
+                    "right_y": pose.right_wrist.y if pose.right_wrist else None,
+                    "landmarks": pose
+                })
+
+        # 2. Greedy bipartite matching
+        matched_candidates = set()
+        matched_players = set()
+
+        pairs = []
+        for c_idx, cand in enumerate(candidates):
+            for p_id, player in self.players.items():
+                dist = np.linalg.norm(cand["center"] - player.center)
+                pairs.append((dist, c_idx, p_id))
+
+        # Sort pairs by distance
+        pairs.sort(key=lambda x: x[0])
+
+        for dist, c_idx, p_id in pairs:
+            if c_idx in matched_candidates or p_id in matched_players:
+                continue
+            if dist < self.tracking_match_threshold:
+                matched_candidates.add(c_idx)
+                matched_players.add(p_id)
+
+                # Update matched player
+                player = self.players[p_id]
+                player.center = candidates[c_idx]["center"]
+                player.update_motion(
+                    left_y=candidates[c_idx]["left_y"],
+                    right_y=candidates[c_idx]["right_y"],
+                    scale=candidates[c_idx]["scale"],
+                    adaptive=self.adaptive_thresholds,
+                    landmarks=candidates[c_idx]["landmarks"]
+                )
+
+        # 3. Create new players for unmatched candidates
+        for c_idx, cand in enumerate(candidates):
+            if c_idx not in matched_candidates:
+                new_id = self.next_player_id
+                self.next_player_id += 1
+                new_player = TrackedPlayer(
+                    player_id=new_id,
+                    center=cand["center"],
+                    tracking_mode=self.mode,
+                    det_kw=self.det_kw
+                )
+                new_player.update_motion(
+                    left_y=cand["left_y"],
+                    right_y=cand["right_y"],
+                    scale=cand["scale"],
+                    adaptive=self.adaptive_thresholds,
+                    landmarks=cand["landmarks"]
+                )
+                self.players[new_id] = new_player
+
+        # 4. Tick unmatched players and remove aged out players
+        for p_id, player in list(self.players.items()):
+            if p_id not in matched_players:
+                player.tick_lost()
+                if time.time() - player.last_seen > self.det_kw["lost_tracking_reset"]:
+                    del self.players[p_id]
+
+        # 5. Return results
+        active_list = list(self.players.values())
+        if not active_list:
+            return MotionFeatures(detected=False)
+
+        # Sort by player ID for consistent UI display
+        active_list.sort(key=lambda x: x.id)
+
+        # For backward compatibility, pick the most active player
+        best_player = max(active_list, key=lambda x: x.activity)
+        any_rep = any(p.rep_completed_this_frame for p in active_list)
+
+        return MotionFeatures(
+            detected=True,
+            wrist_y=best_player.wrist_y,
+            direction=best_player.direction,
+            amplitude=best_player.amplitude,
+            hand_count=len(candidates),
+            rep_completed=any_rep,
+            players=active_list
+        )
 
     def reset(self):
-        """Reset all detectors."""
-        for d in self._detectors:
-            d.reset()
-        self._active_idx = 0
-
-    # ── hand mode ──────────────────────────────────────────────────────────
-
-    def _analyze_hands(self, result: LandmarkResult) -> MotionFeatures:
-        hands = result.hands
-        updated = [False, False]
-        any_rep = False
-        best_dir = "IDLE"
-        best_amp = 0.0
-        best_y = 0.0
-
-        for hand in hands:
-            # assign to left (0) or right (1) detector by x-position
-            idx = 0 if hand.wrist.x < 0.5 else 1
-            rep, direction, amplitude = self._detectors[idx].update(hand.wrist.y)
-            updated[idx] = True
-
-            if rep:
-                any_rep = True
-
-            # choose the more-active detector for display values
-            if self._detectors[idx].activity > self._detectors[1 - idx].activity:
-                self._active_idx = idx
-                best_dir = direction
-                best_amp = amplitude
-                best_y = self._detectors[idx].smooth_y or 0.0
-
-        # tick detectors that weren't fed this frame
-        for i in range(2):
-            if not updated[i]:
-                self._detectors[i].tick()
-
-        # if no hand was clearly more active, use whichever was updated
-        if best_dir == "IDLE":
-            for i, upd in enumerate(updated):
-                if upd:
-                    best_dir = self._detectors[i].direction
-                    best_amp = self._detectors[i].amplitude
-                    best_y = self._detectors[i].smooth_y or 0.0
-                    break
-
-        return MotionFeatures(
-            detected=True,
-            wrist_y=best_y,
-            direction=best_dir,
-            amplitude=best_amp,
-            hand_count=len(hands),
-            rep_completed=any_rep,
-        )
-
-    # ── pose mode ──────────────────────────────────────────────────────────
-
-    def _analyze_pose(self, result: LandmarkResult) -> MotionFeatures:
-        p = result.pose
-
-        # detector 0 = left arm, detector 1 = right arm
-        l_rep, l_dir, l_amp = self._detectors[0].update(p.left_wrist.y)
-        r_rep, r_dir, r_amp = self._detectors[1].update(p.right_wrist.y)
-
-        any_rep = l_rep or r_rep
-
-        # pick the more-active arm for display
-        if self._detectors[0].activity >= self._detectors[1].activity:
-            self._active_idx = 0
-            disp_dir, disp_amp = l_dir, l_amp
-            disp_y = self._detectors[0].smooth_y or 0.0
-        else:
-            self._active_idx = 1
-            disp_dir, disp_amp = r_dir, r_amp
-            disp_y = self._detectors[1].smooth_y or 0.0
-
-        return MotionFeatures(
-            detected=True,
-            wrist_y=disp_y,
-            direction=disp_dir,
-            amplitude=disp_amp,
-            hand_count=2,           # pose always provides both arms
-            rep_completed=any_rep,
-        )
+        """Reset all tracked players."""
+        self.players.clear()
+        self.next_player_id = 1

@@ -84,9 +84,14 @@ class LandmarkResult:
     """Unified result from either tracking mode."""
     mode: str
     hands: list[HandLandmarks] = field(default_factory=list)
-    pose: Optional[PoseLandmarks] = None
+    poses: list[PoseLandmarks] = field(default_factory=list)
     annotated_image: Optional[np.ndarray] = None
     detected: bool = False
+
+    @property
+    def pose(self) -> Optional[PoseLandmarks]:
+        """First detected pose (convenience accessor for backward compatibility)."""
+        return self.poses[0] if self.poses else None
 
     @property
     def hand(self) -> Optional[HandLandmarks]:
@@ -96,6 +101,10 @@ class LandmarkResult:
     @property
     def hand_count(self) -> int:
         return len(self.hands)
+
+    @property
+    def pose_count(self) -> int:
+        return len(self.poses)
 
 
 # ── Tracker ────────────────────────────────────────────────────────────────
@@ -145,13 +154,13 @@ class LandmarkTracker:
                     model_asset_path=self._model_path("pose_landmarker_lite.task")
                 ),
                 running_mode=mp_vision.RunningMode.VIDEO,
-                num_poses=1,
+                num_poses=self.num_hands,
                 min_pose_detection_confidence=0.6,
                 min_pose_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
             self._detector = mp_vision.PoseLandmarker.create_from_options(opts)
-            print("[Tracker] PoseLandmarker initialized.")
+            print(f"[Tracker] PoseLandmarker initialized (num_poses={self.num_hands}).")
 
         else:
             raise ValueError(f"Unknown tracking mode '{self.mode}'. Use 'hand' or 'pose'.")
@@ -223,29 +232,31 @@ class LandmarkTracker:
         if not result.pose_landmarks:
             return LandmarkResult(mode="pose", detected=False, annotated_image=annotated)
 
-        lm = result.pose_landmarks[0]   # list of NormalizedLandmark
+        poses: list[PoseLandmarks] = []
+        for lm in result.pose_landmarks:
+            if self.draw:
+                mp_drawing.draw_landmarks(
+                    image=annotated,
+                    landmark_list=lm,
+                    connections=PoseLandmarksConnections.POSE_LANDMARKS,
+                )
 
-        if self.draw:
-            mp_drawing.draw_landmarks(
-                image=annotated,
-                landmark_list=lm,
-                connections=PoseLandmarksConnections.POSE_LANDMARKS,
+            def p(idx, landmarks=lm) -> Point:
+                return Point(landmarks[idx].x, landmarks[idx].y)
+
+            P = PoseLandmark
+            pose = PoseLandmarks(
+                left_shoulder=p(P.LEFT_SHOULDER),
+                left_elbow=p(P.LEFT_ELBOW),
+                left_wrist=p(P.LEFT_WRIST),
+                right_shoulder=p(P.RIGHT_SHOULDER),
+                right_elbow=p(P.RIGHT_ELBOW),
+                right_wrist=p(P.RIGHT_WRIST),
             )
+            poses.append(pose)
 
-        def p(idx) -> Point:
-            return Point(lm[idx].x, lm[idx].y)
-
-        P = PoseLandmark
-        pose = PoseLandmarks(
-            left_shoulder=p(P.LEFT_SHOULDER),
-            left_elbow=p(P.LEFT_ELBOW),
-            left_wrist=p(P.LEFT_WRIST),
-            right_shoulder=p(P.RIGHT_SHOULDER),
-            right_elbow=p(P.RIGHT_ELBOW),
-            right_wrist=p(P.RIGHT_WRIST),
-        )
         return LandmarkResult(
-            mode="pose", pose=pose, detected=True, annotated_image=annotated
+            mode="pose", poses=poses, detected=True, annotated_image=annotated
         )
 
     def close(self):

@@ -13,12 +13,15 @@ CONFIG_PATH = Path(__file__).parent.parent / "config" / "settings.json"
 DEFAULTS = {
     "camera_index": 0,
     "tracking_mode": "hand",              # "hand" or "pose"
-    "num_hands": 2,                       # how many hands to track (1 or 2)
-    "min_rep_interval_seconds": 0.3,      # cooldown between counted reps
-    "smoothing_factor": 0.35,             # EMA alpha (higher = less smoothing)
-    "min_swing_amplitude": 0.08,          # minimum wrist-Y travel to count a swing
+    "num_hands": 2,                       # fallback for tracking_mode hand
+    "max_players": 4,                     # maximum number of players/poses to track
+    "min_rep_interval_seconds": 0.2,      # lower cooldown (cooldown between counted reps) for faster motion
+    "smoothing_factor": 0.45,             # higher EMA alpha (less lag, faster counting)
+    "min_swing_amplitude": 0.08,          # base minimum wrist-Y travel to count a swing
     "direction_reversal_threshold": 0.015,# minimum Y delta to confirm a reversal
     "lost_tracking_reset_seconds": 1.0,   # seconds without landmarks before reset
+    "tracking_match_threshold": 0.25,     # distance threshold to match players across frames
+    "adaptive_thresholds": True,          # auto-scale swing amplitude based on player distance
     "draw_landmarks": True,
     "save_sessions": True,
 }
